@@ -40,7 +40,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 # Source dirs (read-only — never written to)
-CLAUDE_DIR = Path.home() / ".claude"
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
 CLAUDE_USAGE_DIR = CLAUDE_DIR / "usage-data"
 CLAUDE_FACETS_DIR = CLAUDE_USAGE_DIR / "facets"
 CLAUDE_META_DIR = CLAUDE_USAGE_DIR / "session-meta"
