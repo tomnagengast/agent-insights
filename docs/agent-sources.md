@@ -45,8 +45,9 @@ insights-output/
 ```
 
 Multi-agent runs launch one subprocess per selected agent and wait for all of
-them to finish. The parent process prints a small JSON summary with each agent's
-return code and output paths.
+them to finish. The parent process streams each child's progress output with an
+agent prefix, then prints a small JSON summary with each agent's return code and
+output paths.
 
 ## Parser Notes
 

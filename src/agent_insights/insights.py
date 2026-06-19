@@ -36,6 +36,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -2512,12 +2513,34 @@ def report_subprocess_command(agent: str) -> list[str]:
     return [sys.executable, "-m", "agent_insights.cli", "report", "--agent", agent]
 
 
+@dataclass
+class AgentReportProcess:
+    agent: str
+    process: subprocess.Popen
+    started_at: float
+    stdout: list[str]
+    threads: list[threading.Thread]
+
+
+def drain_agent_report_stdout(stream, buffer: list[str]) -> None:
+    for line in iter(stream.readline, ""):
+        buffer.append(line)
+    stream.close()
+
+
+def stream_agent_report_stderr(agent: str, stream) -> None:
+    for line in iter(stream.readline, ""):
+        print(f"  [{agent}] {line.rstrip()}", file=sys.stderr, flush=True)
+    stream.close()
+
+
 def run_agent_report_subprocesses(args, agents: list[str]) -> None:
-    print("=" * 60, file=sys.stderr)
-    print(f"INSIGHTS PIPELINE - {len(agents)} agents in parallel", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
+    print("=" * 60, file=sys.stderr, flush=True)
+    print(f"INSIGHTS PIPELINE - {len(agents)} agents in parallel", file=sys.stderr, flush=True)
+    print("=" * 60, file=sys.stderr, flush=True)
 
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     package_root = str(Path(__file__).resolve().parents[1])
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -2535,35 +2558,57 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
             cmd.extend(["--project", args.project])
         if getattr(args, "skip_facets", False):
             cmd.append("--skip-facets")
-        print(f"  starting {agent}: {' '.join(cmd)}", file=sys.stderr)
-        processes.append((
-            agent,
-            subprocess.Popen(
-                cmd,
-                cwd=Path.cwd(),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            ),
+        print(f"  starting {agent}: {' '.join(cmd)}", file=sys.stderr, flush=True)
+        process = subprocess.Popen(
+            cmd,
+            cwd=Path.cwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        started_at = time.time()
+        stdout_buffer: list[str] = []
+        stdout_thread = threading.Thread(
+            target=drain_agent_report_stdout,
+            args=(process.stdout, stdout_buffer),
+        )
+        stderr_thread = threading.Thread(
+            target=stream_agent_report_stderr,
+            args=(agent, process.stderr),
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        processes.append(AgentReportProcess(
+            agent=agent,
+            process=process,
+            started_at=started_at,
+            stdout=stdout_buffer,
+            threads=[stdout_thread, stderr_thread],
         ))
 
     results = []
     failed = False
-    for agent, process in processes:
-        stdout, stderr = process.communicate()
-        spec = get_agent_spec(agent, isolated_output=True)
-        if stderr:
-            print(f"\n--- {agent} stderr ---", file=sys.stderr)
-            print(stderr.rstrip(), file=sys.stderr)
-        if process.returncode != 0:
+    for running in processes:
+        returncode = running.process.wait()
+        for thread in running.threads:
+            thread.join()
+        stdout = "".join(running.stdout)
+        spec = get_agent_spec(running.agent, isolated_output=True)
+        print(
+            f"  finished {running.agent}: exit {returncode} in {time.time() - running.started_at:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        if returncode != 0:
             failed = True
             if stdout:
-                print(f"\n--- {agent} stdout ---", file=sys.stderr)
+                print(f"\n--- {running.agent} stdout ---", file=sys.stderr)
                 print(stdout.rstrip()[-4000:], file=sys.stderr)
         results.append({
-            "agent": agent,
-            "returncode": process.returncode,
+            "agent": running.agent,
+            "returncode": returncode,
             "output_dir": str(spec.output_dir),
             "report_json": str(spec.output_dir / "report.json"),
             "report_html": str(spec.output_dir / "report.html"),
