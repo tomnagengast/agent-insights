@@ -2,6 +2,13 @@
 
 All notable changes to `agent-insights` are tracked here.
 
+## v0.1.3 - 2026-06-19
+
+- Adds CI, Dependabot, issue templates, a pull request template, CODEOWNERS, license, security policy, and changelog.
+- Adds docs for installation, getting started, architecture, and contributing.
+- Adds a richer CLI output renderer and a configurable output directory.
+- Updates repository docs and release workflows to use `uv`.
+
 ## v0.1.2 - 2026-06-19
 
 - Adds short `-v` / `--version` support.

@@ -21,14 +21,14 @@ Run the standard checks:
 uv run python -m compileall src
 uv run agent-insights report --dry-run --skip-facets
 uv run --extra release pyinstaller --version
-uv run --extra release scripts/build-release-archive.sh 0.1.2
+uv run --extra release scripts/build-release-archive.sh 0.1.3
 ```
 
 Verify the generated executable:
 
 ```sh
 dist/pyinstaller/agent-insights --version
-tar -tzf dist/release/agent-insights_0.1.2_darwin_arm64.tar.gz
+tar -tzf dist/release/agent-insights_0.1.3_darwin_arm64.tar.gz
 ```
 
 ## Cut a release
@@ -36,8 +36,8 @@ tar -tzf dist/release/agent-insights_0.1.2_darwin_arm64.tar.gz
 Merge the release commit to `main`, then create and push the next semver tag:
 
 ```sh
-git tag -a v0.1.2 -m "v0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.3 -m "v0.1.3"
+git push origin v0.1.3
 ```
 
 The `release` workflow only publishes from tag refs matching `v*.*.*`.
