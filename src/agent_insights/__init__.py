@@ -1,3 +1,3 @@
 """Agent Insights CLI package."""
 
-__version__ = "v0.1.3"
+__version__ = "v0.1.4"

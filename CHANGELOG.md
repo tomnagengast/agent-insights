@@ -2,6 +2,11 @@
 
 All notable changes to `agent-insights` are tracked here.
 
+## v0.1.4 - 2026-06-19
+
+- Fixes `agent-insights -v` and `agent-insights --version` to print the Homebrew-style semver output, such as `agent-insights v0.1.4`.
+- Adds a release archive guard so packaged binaries must match the release tag version.
+
 ## v0.1.3 - 2026-06-19
 
 - Adds CI, Dependabot, issue templates, a pull request template, CODEOWNERS, license, security policy, and changelog.

@@ -21,14 +21,14 @@ Run the standard checks:
 uv run python -m compileall src
 uv run agent-insights report --dry-run --skip-facets
 uv run --extra release pyinstaller --version
-uv run --extra release scripts/build-release-archive.sh 0.1.3
+uv run --extra release scripts/build-release-archive.sh 0.1.4
 ```
 
 Verify the generated executable:
 
 ```sh
 dist/pyinstaller/agent-insights --version
-tar -tzf dist/release/agent-insights_0.1.3_darwin_arm64.tar.gz
+tar -tzf dist/release/agent-insights_0.1.4_darwin_arm64.tar.gz
 ```
 
 ## Cut a release
