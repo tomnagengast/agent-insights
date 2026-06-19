@@ -1710,7 +1710,8 @@ def cmd_facet(args):
         print(json.dumps(facet, indent=2))
         if args.save:
             save_facet(facet)
-            print(f"Saved to {OUT_FACETS_DIR / f'{facet['session_id']}.json'}", file=sys.stderr)
+            facet_path = OUT_FACETS_DIR / f"{facet['session_id']}.json"
+            print(f"Saved to {facet_path}", file=sys.stderr)
     else:
         print("No facet generated", file=sys.stderr)
 
@@ -1763,7 +1764,8 @@ def cmd_facets(args):
         if facet:
             if not args.dry_run:
                 save_facet(facet)
-                print(f"  wrote {OUT_FACETS_DIR / f'{facet['session_id']}.json'}", file=sys.stderr)
+                facet_path = OUT_FACETS_DIR / f"{facet['session_id']}.json"
+                print(f"  wrote {facet_path}", file=sys.stderr)
             generated += 1
             print(f"  [{generated}/{len(need_facets)}] {session.session_id[:8]}: {facet.get('brief_summary', '')[:80]}", file=sys.stderr)
         else:

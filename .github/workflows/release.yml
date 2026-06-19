@@ -1,0 +1,104 @@
+name: release
+
+on:
+  push:
+    tags:
+      - v*.*.*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            goarch: arm64
+          - runner: macos-15-intel
+            goarch: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install release dependencies
+        run: python -m pip install --upgrade '.[release]'
+
+      - name: Build archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          scripts/build-release-archive.sh "${version}" darwin "${GOARCH}"
+        env:
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-insights-darwin-${{ matrix.goarch }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release and cask
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: agent-insights-darwin-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Build checksums
+        run: |
+          cd dist/release
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Publish GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" dist/release/*.tar.gz dist/release/checksums.txt --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v7
+        with:
+          repository: tomnagengast/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew cask
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          arm_sha="$(sha256sum "dist/release/agent-insights_${version}_darwin_arm64.tar.gz" | awk '{print $1}')"
+          intel_sha="$(sha256sum "dist/release/agent-insights_${version}_darwin_amd64.tar.gz" | awk '{print $1}')"
+          mkdir -p homebrew-tap/Casks
+          python3 scripts/render-homebrew-cask.py \
+            homebrew-tap/Casks/agent-insights-cli.rb \
+            "${version}" \
+            "${arm_sha}" \
+            "${intel_sha}"
+
+      - name: Push Homebrew cask
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/agent-insights-cli.rb
+          git commit -m "update agent-insights to ${GITHUB_REF_NAME}" || exit 0
+          git push

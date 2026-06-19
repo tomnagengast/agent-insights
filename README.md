@@ -14,3 +14,14 @@ agent-insights corrections --project /path/to/project --max-sessions 50
 
 Facet and report generation shell out to authenticated `claude -p`, matching
 the original skill behavior.
+
+## Homebrew
+
+Tagged releases publish a Homebrew cask to `tomnagengast/homebrew-tap`:
+
+```bash
+brew tap tomnagengast/tap
+brew install --cask tomnagengast/tap/agent-insights-cli
+```
+
+See [docs/release.md](docs/release.md) for release steps.

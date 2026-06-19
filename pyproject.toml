@@ -14,6 +14,11 @@ authors = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+release = [
+  "pyinstaller>=6.11",
+]
+
 [project.scripts]
 agent-insights = "agent_insights.cli:main"
 
