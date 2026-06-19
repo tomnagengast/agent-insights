@@ -18,7 +18,7 @@ release = [
 [package.metadata]
 requires-dist = [
     { name = "pyinstaller", marker = "extra == 'release'", specifier = ">=6.11" },
-    { name = "rich", specifier = ">=14.0" },
+    { name = "rich", specifier = ">=15.0.0" },
 ]
 provides-extras = ["release"]
 

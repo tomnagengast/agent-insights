@@ -13,7 +13,7 @@ authors = [
   { name = "Thomas Nagengast" },
 ]
 dependencies = [
-  "rich>=14.0",
+  "rich>=15.0.0",
 ]
 
 [project.optional-dependencies]
