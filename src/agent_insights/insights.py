@@ -21,6 +21,9 @@ Usage:
     # Generate reports for several agents in parallel
     agent-insights report --agent claude --agent codex --agent gemini
 
+    # Write generated artifacts to a dedicated directory
+    agent-insights report --output ./tmp/insights-run
+
     # Dry run — show what would happen without making API calls
     agent-insights report --dry-run
 
@@ -103,8 +106,21 @@ class AgentSpec:
 AGENT_CHOICES = ("claude", "codex", "cursor", "gemini")
 
 
-def get_agent_spec(agent_name: str, *, isolated_output: bool = False) -> AgentSpec:
-    output_dir = OUTPUT_DIR if agent_name == "claude" and not isolated_output else OUTPUT_DIR / agent_name
+def resolve_output_base(output: str | None = None) -> Path:
+    if not output:
+        return OUTPUT_DIR
+    path = Path(output).expanduser()
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+def get_agent_spec(
+    agent_name: str,
+    *,
+    isolated_output: bool = False,
+    output_base: Path | None = None,
+) -> AgentSpec:
+    base_dir = output_base or OUTPUT_DIR
+    output_dir = base_dir if agent_name == "claude" and not isolated_output else base_dir / agent_name
     if agent_name == "claude":
         return AgentSpec(
             name="claude",
@@ -2271,7 +2287,7 @@ def build_report_html(stats: dict, sections: dict, spec: AgentSpec | None = None
 def cmd_facet(args):
     """Generate a facet for a single session JSONL file."""
     console = stderr_console()
-    spec = get_agent_spec("claude")
+    spec = get_agent_spec("claude", output_base=resolve_output_base(args.output))
     path = Path(args.session_path)
     console.title("Facet", subtitle=str(path))
     if not path.exists():
@@ -2316,7 +2332,7 @@ def cmd_facet(args):
 def cmd_facets(args):
     """Generate facets for all sessions missing them."""
     console = stderr_console()
-    spec = get_agent_spec("claude")
+    spec = get_agent_spec("claude", output_base=resolve_output_base(args.output))
     console.title("Facets", subtitle=spec.display_name)
     console.phase("Discover sessions")
     all_sessions = discover_sessions(getattr(args, "project", None), spec)
@@ -2596,6 +2612,7 @@ def stream_agent_report_stderr(agent: str, stream, console: ConsoleRenderer, lab
 
 def run_agent_report_subprocesses(args, agents: list[str]) -> None:
     console = stderr_console()
+    output_base = resolve_output_base(getattr(args, "output", None))
     console.title(f"{len(agents)} agents in parallel")
     label_width = max(len(agent) for agent in agents)
 
@@ -2616,6 +2633,8 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
             cmd.append("--dry-run")
         if getattr(args, "project", None):
             cmd.extend(["--project", args.project])
+        if getattr(args, "output", None):
+            cmd.extend(["--output", args.output])
         if getattr(args, "skip_facets", False):
             cmd.append("--skip-facets")
         console.agent_line(agent, f"{console.glyphs.phase} starting {' '.join(cmd)}", label_width=label_width)
@@ -2655,7 +2674,11 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
         for thread in running.threads:
             thread.join()
         stdout = "".join(running.stdout)
-        spec = get_agent_spec(running.agent, isolated_output=True)
+        spec = get_agent_spec(
+            running.agent,
+            isolated_output=True,
+            output_base=output_base,
+        )
         elapsed = time.time() - running.started_at
         if returncode == 0:
             console.agent_line(
@@ -2695,7 +2718,11 @@ def cmd_report(args):
         run_agent_report_subprocesses(args, agents)
         return
 
-    spec = get_agent_spec(agents[0], isolated_output=explicit_agent)
+    spec = get_agent_spec(
+        agents[0],
+        isolated_output=explicit_agent,
+        output_base=resolve_output_base(getattr(args, "output", None)),
+    )
     report = run_report_for_agent(args, spec)
     print(json.dumps(report, indent=2))
 
@@ -2703,6 +2730,7 @@ def cmd_report(args):
 def cmd_corrections(args):
     """Extract corrections from project sessions and synthesize CLAUDE.md rules."""
     console = stderr_console()
+    output_base = resolve_output_base(args.output)
     console.title("Corrections")
     project = getattr(args, "project", None)
     if not project:
@@ -2778,8 +2806,8 @@ def cmd_corrections(args):
         return
 
     # Save raw corrections
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    corrections_path = OUTPUT_DIR / "corrections.json"
+    output_base.mkdir(parents=True, exist_ok=True)
+    corrections_path = output_base / "corrections.json"
     corrections_path.write_text(json.dumps(all_corrections, indent=2))
     console.artifact("corrections", corrections_path)
 
@@ -2802,7 +2830,7 @@ def cmd_corrections(args):
     rules = synthesize_rules(all_corrections, claude_md_content, dry_run=args.dry_run)
 
     if rules:
-        rules_path = OUTPUT_DIR / "rules.json"
+        rules_path = output_base / "rules.json"
         rules_path.write_text(json.dumps(rules, indent=2))
         console.artifact("rules", rules_path)
 
@@ -2851,12 +2879,13 @@ def main():
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--dry-run", action="store_true", help="Show what would happen without making API calls")
     parent.add_argument("--project", help="Scope to a project path (e.g. /path/to/project)")
+    parent.add_argument("--output", help="Directory for generated artifacts (default: ./insights-output)")
     sub = parser.add_subparsers(dest="command")
 
     # facet: single session
     p_facet = sub.add_parser("facet", help="Generate facet for a single session", parents=[parent])
     p_facet.add_argument("session_path", help="Path to session .jsonl file")
-    p_facet.add_argument("--save", action="store_true", help="Save facet to ./insights-output/facets/")
+    p_facet.add_argument("--save", action="store_true", help="Save facet to the output facets directory")
 
     # facets: all missing
     p_facets = sub.add_parser("facets", help="Generate facets for all sessions missing them", parents=[parent])

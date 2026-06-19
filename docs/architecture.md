@@ -8,7 +8,7 @@ Agent sources describe where each harness stores transcripts and which instructi
 
 Discovery scans the configured source roots and builds lightweight session metadata. Project scoping filters sessions to a requested project path when possible.
 
-Facet generation turns one session into structured analytics: goal, categories, outcome, helpfulness, friction, success mode, and a concise summary. Facets are cached under `insights-output/` so repeated reports do not need to reread every transcript.
+Facet generation turns one session into structured analytics: goal, categories, outcome, helpfulness, friction, success mode, and a concise summary. Facets are cached under the output directory, `insights-output/` by default, so repeated reports do not need to reread every transcript.
 
 Report aggregation combines cached facets, asks the LLM for higher-level findings, and writes `report.json` plus `report.html`.
 
@@ -37,6 +37,9 @@ insights-output/<agent>/
 ```
 
 `insights-output/` is generated local output and is ignored by git.
+
+`--output <dir>` swaps the base output directory while preserving the same
+default and explicit-agent layout.
 
 ## Current Boundaries
 

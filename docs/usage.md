@@ -21,6 +21,7 @@ agent-insights report --project /path/to/project
 agent-insights report --project /path/to/project --skip-facets
 agent-insights report --agent codex
 agent-insights report --agent claude --agent codex --agent gemini
+agent-insights report --output ./tmp/insights-run
 ```
 
 Outputs:
@@ -30,6 +31,9 @@ Outputs:
 - `./insights-output/<agent>/report.json` for explicit agent runs
 - `./insights-output/<agent>/report.html` for explicit agent runs
 - cached facets under each output directory's `facets/` folder
+
+Pass `--output <dir>` to replace `./insights-output/` with a dedicated output
+directory. Explicit agent runs still write under `<dir>/<agent>/`.
 
 Use `report` when you want to understand overall agent usage: what kinds of work
 you delegate, where the agent helps, where it creates friction, and which
@@ -64,7 +68,8 @@ agent-insights facet ~/.claude/projects/<project>/<session>.jsonl --save
 Use this to debug a single transcript's classification, such as why a session
 counted as friction or why it was categorized as exploration.
 
-With `--save`, the facet is written to `./insights-output/facets/`.
+With `--save`, the facet is written to `./insights-output/facets/`, or to the
+matching `facets/` directory under `--output`.
 
 ### `corrections`
 
@@ -80,6 +85,8 @@ Outputs:
 
 - `./insights-output/corrections.json`
 - `./insights-output/rules.json`
+
+Pass `--output <dir>` to write these files under a dedicated output directory.
 
 Use corrections when you notice repeated steering: the agent picks the wrong
 workflow, edits the wrong file, over-scopes a change, or makes you restate the
@@ -126,8 +133,8 @@ reusable, then update `CLAUDE.md` in your own voice.
 For a multi-agent review:
 
 ```sh
-agent-insights report --agent claude --agent codex --agent cursor --agent gemini
-open ./insights-output/codex/report.html
+agent-insights report --output ./tmp/agent-review --agent claude --agent codex --agent cursor --agent gemini
+open ./tmp/agent-review/codex/report.html
 ```
 
 Each selected agent runs in its own subprocess and writes to its own output

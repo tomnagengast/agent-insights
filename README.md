@@ -18,8 +18,9 @@ agent-insights report --agent codex
 agent-insights report --agent claude --agent codex --agent cursor --agent gemini
 ```
 
-The report pipeline writes JSON and HTML artifacts under `./insights-output/`.
-Facet and report generation shell out to authenticated `claude -p`.
+The report pipeline writes JSON and HTML artifacts under `./insights-output/`
+by default. Pass `--output <dir>` to use a dedicated output directory for a
+run. Facet and report generation shell out to authenticated `claude -p`.
 
 ## Install
 
@@ -55,6 +56,12 @@ Run reports for multiple agents in parallel:
 
 ```sh
 agent-insights report --agent claude --agent codex --agent cursor --agent gemini
+```
+
+Write a run to a dedicated output directory:
+
+```sh
+agent-insights report --output ./tmp/insights-run
 ```
 
 Use `--dry-run` to inspect what would happen without making LLM calls:

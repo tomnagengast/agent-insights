@@ -10,7 +10,8 @@ agent-insights report --agent claude --agent codex --agent cursor --agent gemini
 
 When no agent is specified, `report` behaves like the original Claude-only tool
 and writes to `./insights-output/`. When an agent is specified explicitly, output
-is isolated under `./insights-output/<agent>/`.
+is isolated under `./insights-output/<agent>/`. Pass `--output <dir>` to replace
+`./insights-output/` with a dedicated base directory.
 
 ## Supported Agents
 
@@ -43,6 +44,10 @@ insights-output/
     facets/
     session-meta/
 ```
+
+Custom output directories preserve the same shape under the chosen base path.
+For example, `agent-insights report --output ./tmp/run --agent codex` writes to
+`tmp/run/codex/`.
 
 Multi-agent runs launch one subprocess per selected agent and wait for all of
 them to finish. The parent process streams each child's progress output with an
