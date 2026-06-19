@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate Claude Code session insights reports.
+Generate AI agent session insights reports.
 
 Reverse-engineered from the claude binary (v2.1.63) on 2026-02-28.
 Traces every API call from /insights execution through report.html generation.
@@ -15,6 +15,12 @@ Usage:
     # Generate the full report (facets + report)
     agent-insights report
 
+    # Generate a report for one non-default agent
+    agent-insights report --agent codex
+
+    # Generate reports for several agents in parallel
+    agent-insights report --agent claude --agent codex --agent gemini
+
     # Dry run — show what would happen without making API calls
     agent-insights report --dry-run
 
@@ -23,6 +29,7 @@ no ANTHROPIC_API_KEY needed. Just needs `claude` on PATH and authenticated.
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -30,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +52,9 @@ CLAUDE_USAGE_DIR = CLAUDE_DIR / "usage-data"
 CLAUDE_FACETS_DIR = CLAUDE_USAGE_DIR / "facets"
 CLAUDE_META_DIR = CLAUDE_USAGE_DIR / "session-meta"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+CODEX_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+CURSOR_DIR = Path(os.environ.get("CURSOR_CONFIG_DIR") or Path.home() / ".cursor").expanduser()
+GEMINI_DIR = Path(os.environ.get("GEMINI_CONFIG_DIR") or Path.home() / ".gemini").expanduser()
 
 # Output dir (all writes go here)
 OUTPUT_DIR = Path.cwd() / "insights-output"
@@ -63,6 +73,67 @@ JSONL_PARSE_BATCH = 10
 FACET_PARALLEL_BATCH = 50
 MAX_TRANSCRIPT_LEN = 30_000
 TRANSCRIPT_CHUNK_SIZE = 25_000
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    display_name: str
+    instruction_file: str
+    config_dir: Path
+    output_dir: Path
+    source_facets_dir: Path | None = None
+    source_meta_dir: Path | None = None
+
+    @property
+    def out_facets_dir(self) -> Path:
+        return self.output_dir / "facets"
+
+    @property
+    def out_meta_dir(self) -> Path:
+        return self.output_dir / "session-meta"
+
+
+AGENT_CHOICES = ("claude", "codex", "cursor", "gemini")
+
+
+def get_agent_spec(agent_name: str, *, isolated_output: bool = False) -> AgentSpec:
+    output_dir = OUTPUT_DIR if agent_name == "claude" and not isolated_output else OUTPUT_DIR / agent_name
+    if agent_name == "claude":
+        return AgentSpec(
+            name="claude",
+            display_name="Claude Code",
+            instruction_file="CLAUDE.md",
+            config_dir=CLAUDE_DIR,
+            output_dir=output_dir,
+            source_facets_dir=CLAUDE_FACETS_DIR,
+            source_meta_dir=CLAUDE_META_DIR,
+        )
+    if agent_name == "codex":
+        return AgentSpec(
+            name="codex",
+            display_name="Codex CLI",
+            instruction_file="AGENTS.md",
+            config_dir=CODEX_DIR,
+            output_dir=output_dir,
+        )
+    if agent_name == "cursor":
+        return AgentSpec(
+            name="cursor",
+            display_name="Cursor CLI",
+            instruction_file=".cursor/rules",
+            config_dir=CURSOR_DIR,
+            output_dir=output_dir,
+        )
+    if agent_name == "gemini":
+        return AgentSpec(
+            name="gemini",
+            display_name="Gemini CLI",
+            instruction_file="GEMINI.md",
+            config_dir=GEMINI_DIR,
+            output_dir=output_dir,
+        )
+    raise ValueError(f"Unsupported agent: {agent_name}")
 
 # ---------------------------------------------------------------------------
 # Prompts (extracted verbatim from binary)
@@ -105,6 +176,144 @@ RESPOND WITH ONLY A VALID JSON OBJECT matching this schema:
   "primary_success": "none|fast_accurate_search|correct_code_edits|good_explanations|proactive_help|multi_file_changes|good_debugging",
   "brief_summary": "One sentence: what user wanted and whether they got it"
 }"""
+
+
+def agent_text(text: str, spec: AgentSpec) -> str:
+    return (
+        text
+        .replace("CLAUDE.md", spec.instruction_file)
+        .replace("Claude Code", spec.display_name)
+        .replace("Claude's", f"{spec.display_name}'s")
+        .replace("Claude", spec.display_name)
+        .replace(" CC ", f" {spec.display_name} ")
+    )
+
+
+def agent_schema_suffix(spec: AgentSpec) -> str:
+    suffix = agent_text(FACET_SCHEMA_SUFFIX, spec)
+    if spec.name != "claude":
+        suffix += (
+            f"\n\nNOTE: keep the key `claude_helpfulness` for compatibility, "
+            f"but evaluate {spec.display_name}'s helpfulness."
+        )
+    return suffix
+
+
+def facet_prompt_prefix(spec: AgentSpec) -> str:
+    return f"""Analyze this {spec.display_name} session and extract structured facets.
+CRITICAL GUIDELINES:
+1. **goal_categories**: Count ONLY what the USER explicitly asked for.
+   - DO NOT count {spec.display_name}'s autonomous codebase exploration
+   - DO NOT count work {spec.display_name} decided to do on its own
+   - ONLY count when user says "can you...", "please...", "I need...", "let's..."
+2. **user_satisfaction_counts**: Base ONLY on explicit user signals.
+   - "Yay!", "great!", "perfect!" -> happy
+   - "thanks", "looks good", "that works" -> satisfied
+   - "ok, now let's..." (continuing without complaint) -> likely_satisfied
+   - "that's not right", "try again" -> dissatisfied
+   - "this is broken", "I give up" -> frustrated
+3. **friction_counts**: Be specific about what went wrong.
+   - misunderstood_request: {spec.display_name} interpreted incorrectly
+   - wrong_approach: Right goal, wrong solution method
+   - buggy_code: Code didn't work correctly
+   - user_rejected_action: User said no/stop to a tool call
+   - excessive_changes: Over-engineered or changed too much
+4. The `claude_helpfulness` field means how helpful this {spec.display_name} session was.
+5. If very short or just warmup, use warmup_minimal for goal_category
+SESSION:
+"""
+
+
+def feature_reference(spec: AgentSpec) -> str:
+    if spec.name == "codex":
+        return """## Codex CLI FEATURES REFERENCE (pick from these for features_to_try):
+1. **AGENTS.md**: Project instructions that shape Codex behavior.
+   - How to use: Add or refine AGENTS.md at the repo root
+   - Good for: standing repo conventions, test commands, review preferences
+2. **Session Resume/Fork**: Continue, fork, archive, or delete local sessions.
+   - How to use: `codex resume`, `codex resume --last`, or `codex fork`
+   - Good for: long-running tasks, parallel alternatives, recovering context
+3. **Non-interactive Mode**: Run Codex from scripts and automation.
+   - How to use: `codex exec "fix the failing tests"`
+   - Good for: repeatable maintenance, CI assistance, scripted code review
+4. **Sandbox and Permissions**: Control what commands and file edits are allowed.
+   - How to use: tune Codex config and approval modes
+   - Good for: safer autonomy on large or sensitive repos
+5. **MCP and Plugins**: Connect Codex to external tools and reusable workflows.
+   - How to use: configure MCP servers or install plugins
+   - Good for: GitHub, Linear, browser testing, docs, and internal systems"""
+    if spec.name == "cursor":
+        return """## Cursor CLI FEATURES REFERENCE (pick from these for features_to_try):
+1. **Cursor Rules**: Repo or user rules that steer Cursor's agent.
+   - How to use: Add rules under `.cursor/rules`
+   - Good for: coding style, framework conventions, common commands
+2. **Session Resume**: Resume recent Cursor agent sessions.
+   - How to use: `cursor-agent resume` or `cursor-agent --resume <thread-id>`
+   - Good for: returning to interrupted CLI work
+3. **IDE Handoff**: Use the CLI with Cursor's editor context.
+   - How to use: start in the CLI, then inspect/refine changes in Cursor
+   - Good for: reviewing diffs and continuing implementation visually
+4. **MCP Servers**: Connect Cursor to external tools.
+   - How to use: configure MCP servers in Cursor settings
+   - Good for: docs, issue trackers, browser tools, databases
+5. **Prompt Scaffolds**: Reusable prompts for repeatable repo tasks.
+   - How to use: save task-specific prompts in project docs or rules
+   - Good for: reviews, migrations, test-fix loops, release chores"""
+    if spec.name == "gemini":
+        return """## Gemini CLI FEATURES REFERENCE (pick from these for features_to_try):
+1. **GEMINI.md**: Project guidance loaded into Gemini CLI context.
+   - How to use: Add or refine GEMINI.md at the repo root
+   - Good for: conventions, commands, architecture notes
+2. **Chat Save/Resume**: Save and resume conversation checkpoints.
+   - How to use: `/chat save <tag>` and `/chat resume <tag>`
+   - Good for: branching investigation and returning to known context
+3. **MCP Servers**: Connect Gemini CLI to external tools.
+   - How to use: configure MCP servers for repo or user workflows
+   - Good for: docs, tickets, web context, internal APIs
+4. **Grounded Research**: Use Gemini's search and large-context strengths.
+   - How to use: ask it to verify current docs before implementation
+   - Good for: API/library migrations and unfamiliar systems
+5. **Antigravity Migration**: Move newer workflows to Antigravity CLI where applicable.
+   - How to use: map Gemini skills, hooks, and extensions to Antigravity plugins
+   - Good for: future-proofing Gemini CLI workflows"""
+    return """## CC FEATURES REFERENCE (pick from these for features_to_try):
+1. **MCP Servers**: Connect Claude to external tools, databases, and APIs via Model Context Protocol.
+   - How to use: Run `claude mcp add <server-name> -- <command>`
+   - Good for: database queries, Slack integration, GitHub issue lookup, connecting to internal APIs
+2. **Custom Skills**: Reusable prompts you define as markdown files that run with a single /command.
+   - How to use: Create `.claude/skills/commit/SKILL.md` with instructions. Then type `/commit` to run it.
+   - Good for: repetitive workflows - /commit, /review, /test, /deploy, /pr, or complex multi-step workflows
+3. **Hooks**: Shell commands that auto-run at specific lifecycle events.
+   - How to use: Add to `.claude/settings.json` under "hooks" key.
+   - Good for: auto-formatting code, running type checks, enforcing conventions
+4. **Headless Mode**: Run Claude non-interactively from scripts and CI/CD.
+   - How to use: `claude -p "fix lint errors" --allowedTools "Edit,Read,Bash"`
+   - Good for: CI/CD integration, batch code fixes, automated reviews
+5. **Task Agents**: Claude spawns focused sub-agents for complex exploration or parallel work.
+   - How to use: Claude auto-invokes when helpful, or ask "use an agent to explore X"
+   - Good for: codebase exploration, understanding complex systems"""
+
+
+def report_prompts(spec: AgentSpec) -> list[dict]:
+    prompts = []
+    for prompt_def in REPORT_PROMPTS:
+        prompt_def = copy.deepcopy(prompt_def)
+        prompt = agent_text(prompt_def["prompt"], spec)
+        if spec.name != "claude":
+            prompt = prompt.replace(
+                '"claude_md_additions"',
+                f'"{spec.name}_instruction_additions"',
+            )
+        if prompt_def["name"] == "suggestions":
+            prompt = re.sub(
+                r"## .*?FEATURES REFERENCE[\s\S]*?RESPOND WITH ONLY A VALID JSON OBJECT:",
+                feature_reference(spec) + "\nRESPOND WITH ONLY A VALID JSON OBJECT:",
+                prompt,
+                count=1,
+            )
+        prompt_def["prompt"] = prompt
+        prompts.append(prompt_def)
+    return prompts
 
 CHUNK_SUMMARIZE_PROMPT = """Summarize this portion of a Claude Code session transcript. Focus on:
 1. What the user asked for
@@ -292,6 +501,8 @@ class ParsedSession:
     modified: datetime
     messages: list  # [{type, message?, ...}]
     first_prompt: str = ""
+    agent: str = "claude"
+    agent_display: str = "Claude Code"
 
     @property
     def start_time(self) -> str:
@@ -302,8 +513,238 @@ class ParsedSession:
         return max(1, round((self.modified - self.created).total_seconds() / 60))
 
 
-def parse_jsonl(path: str | Path) -> ParsedSession | None:
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = value / 1000 if value > 10_000_000_000 else value
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _first_str(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (int, float, bool)):
+        return str(content)
+    if isinstance(content, list):
+        parts = [_content_to_text(item) for item in content]
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        if content.get("type") == "tool_use" and content.get("name"):
+            return f"[Tool: {content['name']}]"
+        for key in ("text", "content", "message", "output", "summary", "value"):
+            text = _content_to_text(content.get(key))
+            if text:
+                return text
+        if "parts" in content:
+            return _content_to_text(content["parts"])
+    return ""
+
+
+def _infer_role(obj: dict) -> str:
+    role = _first_str(
+        obj.get("role"),
+        obj.get("type"),
+        obj.get("author"),
+        obj.get("speaker"),
+        obj.get("sender"),
+    ).lower()
+    message = obj.get("message")
+    if isinstance(message, dict):
+        role = role or _first_str(message.get("role"), message.get("type")).lower()
+    if role in ("human", "prompt", "input"):
+        return "user"
+    if role in ("model", "ai", "bot", "agent"):
+        return "assistant"
+    if role in ("user", "assistant"):
+        return role
+    return ""
+
+
+def _extract_tool_name(obj: dict) -> str:
+    for key in ("tool", "tool_name", "name", "command", "cmd"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("function", "call"):
+        value = obj.get(key)
+        if isinstance(value, dict):
+            name = value.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return ""
+
+
+def _record_payload(obj: dict) -> dict:
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return obj
+    record = dict(payload)
+    record.setdefault("timestamp", obj.get("timestamp"))
+    outer_type = obj.get("type")
+    if outer_type == "response_item":
+        record.setdefault("event", record.get("type"))
+    elif outer_type == "event_msg":
+        payload_type = record.get("type")
+        if payload_type == "user_message":
+            record["role"] = "user"
+            record["content"] = record.get("message")
+        elif payload_type == "agent_message":
+            record["role"] = "assistant"
+            record["content"] = record.get("message")
+        else:
+            record.setdefault("event", payload_type)
+    elif outer_type in ("session_meta", "turn_context"):
+        record.setdefault("event", outer_type)
+    return record
+
+
+def _is_context_injection(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith((
+        "# AGENTS.md instructions",
+        "<permissions instructions>",
+        "<environment_context>",
+        "<app-context>",
+        "<collaboration_mode>",
+        "<skills_instructions>",
+        "<plugins_instructions>",
+    ))
+
+
+def _normalize_generic_message(obj: dict) -> dict | None:
+    obj = _record_payload(obj)
+    typ = _first_str(obj.get("type"), obj.get("event"), obj.get("kind")).lower()
+    if "tool" in typ or typ in ("function_call", "function-call", "exec", "command"):
+        name = _extract_tool_name(obj) or typ
+        return {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": name}]},
+            "timestamp": obj.get("timestamp") or obj.get("time") or obj.get("created_at"),
+            "cwd": obj.get("cwd") or obj.get("project_path"),
+        }
+
+    role = _infer_role(obj)
+    if not role:
+        return None
+
+    message = obj.get("message")
+    content = None
+    if isinstance(message, dict):
+        content = message.get("content") or message.get("text") or message.get("parts")
+    elif message is not None:
+        content = message
+    if content is None:
+        content = obj.get("content") or obj.get("text") or obj.get("parts") or obj.get("output")
+
+    text = _content_to_text(content)
+    if not text:
+        return None
+    if role == "user" and _is_context_injection(text):
+        return None
+
+    return {
+        "type": role,
+        "message": {"content": text},
+        "timestamp": obj.get("timestamp") or obj.get("time") or obj.get("created_at") or obj.get("createdAt"),
+        "cwd": obj.get("cwd") or obj.get("project_path") or obj.get("workspace") or obj.get("root"),
+    }
+
+
+def _iter_message_candidates(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_message_candidates(item)
+    elif isinstance(value, dict):
+        record = _record_payload(value)
+        record_type = _first_str(record.get("type"), record.get("event"), record.get("kind")).lower()
+        if _infer_role(record) or "tool" in record_type or record_type in ("function_call", "function-call"):
+            yield value
+            return
+        for key in ("messages", "history", "turns", "conversation", "entries", "items", "events"):
+            if key in value:
+                yield from _iter_message_candidates(value[key])
+
+
+def _build_parsed_session(
+    *,
+    path: Path,
+    spec: AgentSpec,
+    raw_objects: list[dict],
+    normalized_messages: list[dict],
+) -> ParsedSession | None:
+    session_id = None
+    project_path = ""
+    first_prompt = ""
+    timestamps = []
+
+    for obj in raw_objects + normalized_messages:
+        record = _record_payload(obj) if isinstance(obj, dict) else obj
+        if not session_id:
+            session_id = _first_str(
+                record.get("sessionId") if isinstance(record, dict) else None,
+                record.get("session_id") if isinstance(record, dict) else None,
+                record.get("sessionID") if isinstance(record, dict) else None,
+                record.get("conversation_id") if isinstance(record, dict) else None,
+                record.get("id") if isinstance(record, dict) else None,
+            )
+        if not project_path and isinstance(record, dict):
+            project_path = _first_str(
+                record.get("cwd"),
+                record.get("project_path"),
+                record.get("workspace"),
+                record.get("root"),
+                record.get("directory"),
+            )
+            metadata = record.get("metadata")
+            if not project_path and isinstance(metadata, dict):
+                project_path = _first_str(metadata.get("cwd"), metadata.get("project_path"), metadata.get("workspace"))
+        ts = _parse_timestamp(record.get("timestamp") or record.get("time") or record.get("created_at") or record.get("createdAt")) if isinstance(record, dict) else None
+        if ts:
+            timestamps.append(ts)
+
+    for msg in normalized_messages:
+        if msg.get("type") == "user" and not first_prompt:
+            first_prompt = _content_to_text(msg.get("message", {}).get("content"))[:200]
+            break
+
+    stat = path.stat()
+    created = timestamps[0] if timestamps else datetime.fromtimestamp(stat.st_birthtime if hasattr(stat, 'st_birthtime') else stat.st_ctime)
+    modified = timestamps[-1] if timestamps else datetime.fromtimestamp(stat.st_mtime)
+
+    return ParsedSession(
+        session_id=session_id or path.stem,
+        project_path=project_path,
+        created=created,
+        modified=modified,
+        messages=normalized_messages,
+        first_prompt=first_prompt,
+        agent=spec.name,
+        agent_display=spec.display_name,
+    )
+
+
+def parse_jsonl(path: str | Path, spec: AgentSpec | None = None) -> ParsedSession | None:
     """Parse a session JSONL file into a structured session object."""
+    spec = spec or get_agent_spec("claude")
     path = Path(path)
     messages = []
     session_id = None
@@ -362,7 +803,65 @@ def parse_jsonl(path: str | Path) -> ParsedSession | None:
         modified=modified,
         messages=messages,
         first_prompt=first_prompt,
+        agent=spec.name,
+        agent_display=spec.display_name,
     )
+
+
+def parse_generic_session(path: str | Path, spec: AgentSpec) -> ParsedSession | None:
+    path = Path(path)
+    raw_objects: list[dict] = []
+    messages: list[dict] = []
+
+    if path.suffix == ".jsonl":
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    raw_objects.append(obj)
+                    normalized = _normalize_generic_message(obj)
+                    if normalized:
+                        messages.append(normalized)
+                    else:
+                        for candidate in _iter_message_candidates(obj):
+                            normalized = _normalize_generic_message(candidate)
+                            if normalized:
+                                messages.append(normalized)
+    else:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if isinstance(data, dict):
+            raw_objects.append(data)
+        for candidate in _iter_message_candidates(data):
+            if isinstance(candidate, dict):
+                raw_objects.append(candidate)
+                normalized = _normalize_generic_message(candidate)
+                if normalized:
+                    messages.append(normalized)
+
+    if not messages:
+        return None
+
+    return _build_parsed_session(
+        path=path,
+        spec=spec,
+        raw_objects=raw_objects,
+        normalized_messages=messages,
+    )
+
+
+def parse_agent_session(path: str | Path, spec: AgentSpec) -> ParsedSession | None:
+    if spec.name == "claude":
+        return parse_jsonl(path, spec)
+    return parse_generic_session(path, spec)
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +871,7 @@ def parse_jsonl(path: str | Path) -> ParsedSession | None:
 def format_transcript(session: ParsedSession) -> str:
     """Format a parsed session into the text transcript sent to the LLM."""
     lines = [
+        f"Agent: {session.agent_display}",
         f"Session: {session.session_id[:8]}",
         f"Date: {session.start_time}",
         f"Project: {session.project_path}",
@@ -611,25 +1111,17 @@ def extract_json(text: str) -> dict | None:
 # Phase 1-3: Session discovery & session-meta
 # ---------------------------------------------------------------------------
 
-def discover_sessions(project_path: str | None = None) -> list[dict]:
-    """Find session JSONL files, optionally scoped to a single project.
-
-    If project_path is given (e.g. "/Users/you/myproject"),
-    only returns sessions from matching project dirs (including worktrees).
-    """
+def _discover_claude_sessions(project_path: str | None, spec: AgentSpec) -> list[dict]:
+    projects_dir = spec.config_dir / "projects"
     sessions = []
-    if not PROJECTS_DIR.exists():
+    if not projects_dir.exists():
         return sessions
 
-    # Build project dir filter from project_path
     project_dirs = None
     if project_path:
-        # Claude Code encodes project paths as dir names: /Users/tom/foo → -Users-tom-foo
         encoded = project_path.replace("/", "-")
-        if encoded.startswith("-"):
-            encoded = encoded  # already has leading dash
         project_dirs = []
-        for d in PROJECTS_DIR.iterdir():
+        for d in projects_dir.iterdir():
             if d.is_dir() and (d.name == encoded or d.name.startswith(encoded + "-")):
                 project_dirs.append(d)
         if not project_dirs:
@@ -637,7 +1129,7 @@ def discover_sessions(project_path: str | None = None) -> list[dict]:
             print(f"    Looking for: {encoded}*", file=sys.stderr)
 
     scan_dirs = project_dirs if project_dirs else [
-        d for d in PROJECTS_DIR.iterdir() if d.is_dir()
+        d for d in projects_dir.iterdir() if d.is_dir()
     ]
 
     for project_dir in scan_dirs:
@@ -649,22 +1141,74 @@ def discover_sessions(project_path: str | None = None) -> list[dict]:
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
             })
+    return sessions
+
+
+def _discover_generic_sessions(project_path: str | None, spec: AgentSpec) -> list[dict]:
+    roots = {
+        "codex": [spec.config_dir / "sessions"],
+        "cursor": [spec.config_dir / "projects"],
+        "gemini": [spec.config_dir / "tmp"],
+    }[spec.name]
+    suffixes = {".jsonl"} if spec.name == "cursor" else {".jsonl", ".json"}
+    sessions = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            if spec.name == "cursor" and "/mcps/" in path.as_posix():
+                continue
+            if project_path and project_path not in str(path):
+                parsed = parse_agent_session(path, spec)
+                if not parsed or parsed.project_path != project_path:
+                    continue
+            stat = path.stat()
+            sessions.append({
+                "session_id": path.stem,
+                "path": str(path),
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+            })
+    return sessions
+
+
+def discover_sessions(project_path: str | None = None, spec: AgentSpec | None = None) -> list[dict]:
+    """Find session JSONL files, optionally scoped to a single project.
+
+    If project_path is given (e.g. "/Users/you/myproject"),
+    only returns sessions from matching project dirs (including worktrees).
+    """
+    spec = spec or get_agent_spec("claude")
+    if spec.name == "claude":
+        sessions = _discover_claude_sessions(project_path, spec)
+    else:
+        sessions = _discover_generic_sessions(project_path, spec)
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions
 
 
-def load_cached_session_meta(session_id: str) -> dict | None:
-    """Load existing session-meta from ~/.claude (read-only)."""
-    path = CLAUDE_META_DIR / f"{session_id}.json"
-    if path.exists():
-        return json.loads(path.read_text())
+def load_cached_session_meta(session_id: str, spec: AgentSpec | None = None) -> dict | None:
+    """Load existing session-meta from the agent cache when available."""
+    spec = spec or get_agent_spec("claude")
+    for d in (spec.out_meta_dir, spec.source_meta_dir):
+        if not d:
+            continue
+        path = d / f"{session_id}.json"
+        if path.exists():
+            return json.loads(path.read_text())
     return None
 
 
-def load_cached_facet(session_id: str) -> dict | None:
-    """Load existing facet — checks local output dir first, then ~/.claude."""
-    for d in (OUT_FACETS_DIR, CLAUDE_FACETS_DIR):
+def load_cached_facet(session_id: str, spec: AgentSpec | None = None) -> dict | None:
+    """Load existing facet — checks local output dir first, then agent cache."""
+    spec = spec or get_agent_spec("claude")
+    for d in (spec.out_facets_dir, spec.source_facets_dir):
+        if not d:
+            continue
         path = d / f"{session_id}.json"
         if path.exists():
             facet = json.loads(path.read_text())
@@ -673,10 +1217,11 @@ def load_cached_facet(session_id: str) -> dict | None:
     return None
 
 
-def save_facet(facet: dict) -> None:
+def save_facet(facet: dict, spec: AgentSpec | None = None) -> None:
     """Write facet JSON to local output dir."""
-    OUT_FACETS_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUT_FACETS_DIR / f"{facet['session_id']}.json"
+    spec = spec or get_agent_spec("claude")
+    spec.out_facets_dir.mkdir(parents=True, exist_ok=True)
+    path = spec.out_facets_dir / f"{facet['session_id']}.json"
     path.write_text(json.dumps(facet, indent=2))
 
 
@@ -684,23 +1229,25 @@ def save_facet(facet: dict) -> None:
 # Phase 4: Facet generation (LLM call #1 per session)
 # ---------------------------------------------------------------------------
 
-def summarize_chunk(chunk: str) -> str:
+def summarize_chunk(chunk: str, spec: AgentSpec | None = None) -> str:
     """Summarize a long transcript chunk via LLM (for sessions > 30k chars).
 
     API call: Opus, max_tokens=500, prompt=CHUNK_SUMMARIZE_PROMPT + chunk
     """
+    spec = spec or get_agent_spec("claude")
     text = call_api(
         model=FACET_MODEL,
         system="",
-        user_prompt=CHUNK_SUMMARIZE_PROMPT + chunk,
+        user_prompt=agent_text(CHUNK_SUMMARIZE_PROMPT, spec) + chunk,
         max_tokens=500,
         label="chunk-summarize",
     )
     return text or chunk[:2000]
 
 
-def prepare_transcript(session: ParsedSession) -> str:
+def prepare_transcript(session: ParsedSession, spec: AgentSpec | None = None) -> str:
     """Format transcript, summarizing chunks if > 30k chars (replicates hb8)."""
+    spec = spec or get_agent_spec(session.agent)
     transcript = format_transcript(session)
 
     if len(transcript) <= MAX_TRANSCRIPT_LEN:
@@ -712,10 +1259,11 @@ def prepare_transcript(session: ParsedSession) -> str:
         chunks.append(transcript[i : i + TRANSCRIPT_CHUNK_SIZE])
 
     print(f"  Long session ({len(transcript)} chars) — summarizing {len(chunks)} chunks", file=sys.stderr)
-    summaries = [summarize_chunk(c) for c in chunks]
+    summaries = [summarize_chunk(c, spec) for c in chunks]
 
     meta = extract_session_meta(session)
     header = "\n".join([
+        f"Agent: {session.agent_display}",
         f"Session: {meta['session_id'][:8]}",
         f"Date: {meta['start_time']}",
         f"Project: {meta['project_path']}",
@@ -726,15 +1274,16 @@ def prepare_transcript(session: ParsedSession) -> str:
     return header + "\n".join(summaries)
 
 
-def generate_facet(session: ParsedSession, dry_run: bool = False) -> dict | None:
+def generate_facet(session: ParsedSession, spec: AgentSpec | None = None, dry_run: bool = False) -> dict | None:
     """Generate a facet for a single session.
 
     API call: Opus, max_tokens=4096
     System: empty
     User prompt: FACET_PROMPT_PREFIX + transcript + FACET_SCHEMA_SUFFIX
     """
-    transcript = prepare_transcript(session)
-    user_prompt = FACET_PROMPT_PREFIX + transcript + FACET_SCHEMA_SUFFIX
+    spec = spec or get_agent_spec(session.agent)
+    transcript = format_transcript(session) if dry_run else prepare_transcript(session, spec)
+    user_prompt = facet_prompt_prefix(spec) + transcript + agent_schema_suffix(spec)
 
     if dry_run:
         print(f"  [DRY RUN] Would generate facet for {session.session_id[:8]}", file=sys.stderr)
@@ -758,6 +1307,7 @@ def generate_facet(session: ParsedSession, dry_run: bool = False) -> dict | None
         return None
 
     facet["session_id"] = session.session_id
+    facet["agent"] = spec.name
     return facet
 
 
@@ -1063,8 +1613,9 @@ def aggregate_stats(
 # Phase 6: Report generation (7+1 parallel LLM calls)
 # ---------------------------------------------------------------------------
 
-def build_report_context(stats: dict, facets: dict[str, dict]) -> str:
+def build_report_context(stats: dict, facets: dict[str, dict], spec: AgentSpec | None = None) -> str:
     """Build the context string sent to each report prompt (replicates fb8)."""
+    spec = spec or get_agent_spec("claude")
     summaries = "\n".join(
         f"- {f['brief_summary']} ({f['outcome']}, {f.get('claude_helpfulness', 'unknown')})"
         for f in list(facets.values())[:50]
@@ -1092,10 +1643,11 @@ def build_report_context(stats: dict, facets: dict[str, dict]) -> str:
     }, indent=2)
 
     return (
-        compact_stats
+        f"AGENT: {spec.display_name}\n"
+        + compact_stats
         + "\nSESSION SUMMARIES:\n" + summaries
         + "\nFRICTION DETAILS:\n" + friction_details
-        + "\nUSER INSTRUCTIONS TO CLAUDE:\nNone captured"
+        + f"\nUSER INSTRUCTIONS TO {spec.display_name.upper()}:\nNone captured"
     )
 
 
@@ -1135,6 +1687,7 @@ def generate_report_section(
 def generate_at_a_glance(
     context: str,
     sections: dict[str, dict],
+    spec: AgentSpec | None = None,
     dry_run: bool = False,
 ) -> dict | None:
     """Generate the at_a_glance summary using results from other sections.
@@ -1167,11 +1720,12 @@ def generate_at_a_glance(
         for o in (sections.get("on_the_horizon", {}).get("opportunities") or [])
     )
 
-    prompt = f"""You're writing an "At a Glance" summary for a Claude Code usage insights report for Claude Code users. The goal is to help them understand their usage and improve how they can use Claude better, especially as models improve.
+    spec = spec or get_agent_spec("claude")
+    prompt = f"""You're writing an "At a Glance" summary for a {spec.display_name} usage insights report for {spec.display_name} users. The goal is to help them understand their usage and improve how they can use {spec.display_name} better, especially as models improve.
 Use this 4-part structure:
-1. **What's working** - What is the user's unique style of interacting with Claude and what are some impactful things they've done? You can include one or two details, but keep it high level since things might not be fresh in the user's memory. Don't be fluffy or overly complimentary. Also, don't focus on the tool calls they use.
-2. **What's hindering you** - Split into (a) Claude's fault (misunderstandings, wrong approaches, bugs) and (b) user-side friction (not providing enough context, environment issues -- ideally more general than just one project). Be honest but constructive.
-3. **Quick wins to try** - Specific Claude Code features they could try from the examples below, or a workflow technique if you think it's really compelling. (Avoid stuff like "Ask Claude to confirm before taking actions" or "Type out more context up front" which are less compelling.)
+1. **What's working** - What is the user's unique style of interacting with {spec.display_name} and what are some impactful things they've done? You can include one or two details, but keep it high level since things might not be fresh in the user's memory. Don't be fluffy or overly complimentary. Also, don't focus on the tool calls they use.
+2. **What's hindering you** - Split into (a) {spec.display_name}'s fault (misunderstandings, wrong approaches, bugs) and (b) user-side friction (not providing enough context, environment issues -- ideally more general than just one project). Be honest but constructive.
+3. **Quick wins to try** - Specific {spec.display_name} features they could try from the examples below, or a workflow technique if you think it's really compelling. (Avoid stuff like "Ask the agent to confirm before taking actions" or "Type out more context up front" which are less compelling.)
 4. **Ambitious workflows for better models** - As we move to much more capable models over the next 3-6 months, what should they prepare for? What workflows that seem impossible now will become possible? Draw from the appropriate section below.
 Keep each section to 2-3 not-too-long sentences. Don't overwhelm the user. Don't mention specific numerical stats or underlined_categories from the session data below. Use a coaching tone.
 RESPOND WITH ONLY A VALID JSON OBJECT:
@@ -1242,8 +1796,9 @@ def _bar_rows(data: dict | list, color: str, display_names: dict | None = None) 
     return "\n".join(rows)
 
 
-def build_report_html(stats: dict, sections: dict) -> str:
+def build_report_html(stats: dict, sections: dict, spec: AgentSpec | None = None) -> str:
     """Build report.html from stats + section JSON (replicates yb8 template)."""
+    spec = spec or get_agent_spec("claude")
     s = sections
     total_msgs = stats.get("total_messages", 0)
     total_sessions = stats.get("total_sessions", 0)
@@ -1336,7 +1891,7 @@ def build_report_html(stats: dict, sections: dict) -> str:
         paragraphs = "".join(f"<p>{_esc(p.strip())}</p>" for p in narrative.split("\n\n") if p.strip())
         key = ist.get("key_pattern", "")
         style_html = f"""
-    <h2 id="section-usage">How You Use Claude Code</h2>
+    <h2 id="section-usage">How You Use {_esc(spec.display_name)}</h2>
     <div class="narrative">
       {paragraphs}
       <div class="key-insight"><strong>Key pattern:</strong> {_esc(key)}</div>
@@ -1410,12 +1965,13 @@ def build_report_html(stats: dict, sections: dict) -> str:
       </div>
     </div>"""
 
-    # Suggestions: CLAUDE.md additions
+    # Suggestions: agent instruction additions
     suggestions_html = ""
     sg = s.get("suggestions", {})
-    if sg.get("claude_md_additions"):
+    instruction_items = sg.get("claude_md_additions") or sg.get(f"{spec.name}_instruction_additions")
+    if instruction_items:
         items = []
-        for i, cmd in enumerate(sg["claude_md_additions"]):
+        for i, cmd in enumerate(instruction_items):
             addition = _esc(cmd.get("addition", ""))
             why = _esc(cmd.get("why", ""))
             items.append(f"""
@@ -1428,10 +1984,10 @@ def build_report_html(stats: dict, sections: dict) -> str:
           <div class="cmd-why">{why}</div>
         </div>""")
         suggestions_html = f"""
-    <h2 id="section-features">Existing CC Features to Try</h2>
+    <h2 id="section-features">Existing {_esc(spec.display_name)} Features to Try</h2>
     <div class="claude-md-section">
-      <h3>Suggested CLAUDE.md Additions</h3>
-      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">Copy into Claude Code to add to your CLAUDE.md.</p>
+      <h3>Suggested {_esc(spec.instruction_file)} Additions</h3>
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">Copy into {_esc(spec.display_name)} to add to your {_esc(spec.instruction_file)}.</p>
       <div class="claude-md-actions">
         <button class="copy-all-btn" onclick="copyAllCheckedClaudeMd()">Copy All Checked</button>
       </div>
@@ -1455,7 +2011,7 @@ def build_report_html(stats: dict, sections: dict) -> str:
           </div></div></div>
         </div>""")
         features_html = f"""
-    <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">Copy into Claude Code and it'll set it up for you.</p>
+    <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">Copy into {_esc(spec.display_name)} and it'll set it up for you.</p>
     <div class="features-section">{''.join(cards)}
     </div>"""
 
@@ -1471,7 +2027,7 @@ def build_report_html(stats: dict, sections: dict) -> str:
           <div class="pattern-summary">{_esc(p.get('suggestion', ''))}</div>
           <div class="pattern-detail">{_esc(p.get('detail', ''))}</div>
           <div class="copyable-prompt-section">
-            <div class="prompt-label">Paste into Claude Code:</div>
+            <div class="prompt-label">Paste into {_esc(spec.display_name)}:</div>
             <div class="copyable-prompt-row">
               <code class="copyable-prompt">{prompt}</code>
               <button class="copy-btn" onclick="copyText(this)">Copy</button>
@@ -1479,8 +2035,8 @@ def build_report_html(stats: dict, sections: dict) -> str:
           </div>
         </div>""")
         patterns_html = f"""
-    <h2 id="section-patterns">New Ways to Use Claude Code</h2>
-    <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">Copy into Claude Code and it'll walk you through it.</p>
+    <h2 id="section-patterns">New Ways to Use {_esc(spec.display_name)}</h2>
+    <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">Copy into {_esc(spec.display_name)} and it'll walk you through it.</p>
     <div class="patterns-section">{''.join(cards)}
     </div>"""
 
@@ -1496,7 +2052,7 @@ def build_report_html(stats: dict, sections: dict) -> str:
           <div class="horizon-title">{_esc(o.get('title', ''))}</div>
           <div class="horizon-possible">{_esc(o.get('whats_possible', ''))}</div>
           <div class="horizon-tip"><strong>Getting started:</strong> {_esc(o.get('how_to_try', ''))}</div>
-          <div class="pattern-prompt"><div class="prompt-label">Paste into Claude Code:</div><code>{prompt}</code><button class="copy-btn" onclick="copyText(this)">Copy</button></div>
+          <div class="pattern-prompt"><div class="prompt-label">Paste into {_esc(spec.display_name)}:</div><code>{prompt}</code><button class="copy-btn" onclick="copyText(this)">Copy</button></div>
         </div>""")
         intro = _esc(oh.get("intro", ""))
         horizon_html = f"""
@@ -1520,7 +2076,7 @@ def build_report_html(stats: dict, sections: dict) -> str:
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Claude Code Insights</title>
+  <title>{_esc(spec.display_name)} Insights</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -1612,13 +2168,13 @@ def build_report_html(stats: dict, sections: dict) -> str:
 </head>
 <body>
   <div class="container">
-    <h1>Claude Code Insights</h1>
+    <h1>{_esc(spec.display_name)} Insights</h1>
     <p class="subtitle">{_esc(subtitle)}</p>
     {at_a_glance_html}
 
     <nav class="nav-toc">
       <a href="#section-work">What You Work On</a>
-      <a href="#section-usage">How You Use CC</a>
+      <a href="#section-usage">How You Use {_esc(spec.display_name)}</a>
       <a href="#section-wins">Impressive Things</a>
       <a href="#section-friction">Where Things Go Wrong</a>
       <a href="#section-features">Features to Try</a>
@@ -1683,13 +2239,14 @@ def build_report_html(stats: dict, sections: dict) -> str:
 
 def cmd_facet(args):
     """Generate a facet for a single session JSONL file."""
+    spec = get_agent_spec("claude")
     path = Path(args.session_path)
     if not path.exists():
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Parsing {path}...", file=sys.stderr)
-    session = parse_jsonl(path)
+    session = parse_agent_session(path, spec)
     if not session:
         print("Failed to parse session", file=sys.stderr)
         sys.exit(1)
@@ -1705,12 +2262,12 @@ def cmd_facet(args):
         print(f"Skipping: doesn't meet minimum criteria (need >=2 user msgs, >=1 min)", file=sys.stderr)
         sys.exit(0)
 
-    facet = generate_facet(session, dry_run=args.dry_run)
+    facet = generate_facet(session, spec, dry_run=args.dry_run)
     if facet:
         print(json.dumps(facet, indent=2))
         if args.save:
-            save_facet(facet)
-            facet_path = OUT_FACETS_DIR / f"{facet['session_id']}.json"
+            save_facet(facet, spec)
+            facet_path = spec.out_facets_dir / f"{facet['session_id']}.json"
             print(f"Saved to {facet_path}", file=sys.stderr)
     else:
         print("No facet generated", file=sys.stderr)
@@ -1718,8 +2275,9 @@ def cmd_facet(args):
 
 def cmd_facets(args):
     """Generate facets for all sessions missing them."""
+    spec = get_agent_spec("claude")
     print("Phase 1: Discovering sessions...", file=sys.stderr)
-    all_sessions = discover_sessions(getattr(args, "project", None))
+    all_sessions = discover_sessions(getattr(args, "project", None), spec)
     print(f"  Found {len(all_sessions)} session JSONL files", file=sys.stderr)
 
     print("\nPhase 2-3: Loading cached session-meta and facets...", file=sys.stderr)
@@ -1729,7 +2287,7 @@ def cmd_facets(args):
         sid = info["session_id"]
 
         # Check if facet already exists
-        existing = load_cached_facet(sid)
+        existing = load_cached_facet(sid, spec)
         if existing:
             continue
 
@@ -1747,7 +2305,7 @@ def cmd_facets(args):
     skipped_failed = 0
 
     for info in need_facets:
-        session = parse_jsonl(info["path"])
+        session = parse_agent_session(info["path"], spec)
         if not session:
             skipped_parse += 1
             continue
@@ -1760,11 +2318,11 @@ def cmd_facets(args):
             skipped_criteria += 1
             continue
 
-        facet = generate_facet(session, dry_run=args.dry_run)
+        facet = generate_facet(session, spec, dry_run=args.dry_run)
         if facet:
             if not args.dry_run:
-                save_facet(facet)
-                facet_path = OUT_FACETS_DIR / f"{facet['session_id']}.json"
+                save_facet(facet, spec)
+                facet_path = spec.out_facets_dir / f"{facet['session_id']}.json"
                 print(f"  wrote {facet_path}", file=sys.stderr)
             generated += 1
             print(f"  [{generated}/{len(need_facets)}] {session.session_id[:8]}: {facet.get('brief_summary', '')[:80]}", file=sys.stderr)
@@ -1777,19 +2335,19 @@ def cmd_facets(args):
               f"{skipped_criteria} below minimum criteria, {skipped_failed} LLM call failed", file=sys.stderr)
 
 
-def cmd_report(args):
+def run_report_for_agent(args, spec: AgentSpec) -> dict:
     """Full pipeline: discover → session-meta → facets → aggregate → report."""
     print("=" * 60, file=sys.stderr)
-    print("INSIGHTS PIPELINE — Full Replication", file=sys.stderr)
+    print(f"INSIGHTS PIPELINE - {spec.display_name}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     total_start = time.time()
 
     # Phase 1: Discover
     project = getattr(args, "project", None)
     print("\n--- Phase 1: Discover session JSONL files ---", file=sys.stderr)
-    all_sessions = discover_sessions(project)
+    all_sessions = discover_sessions(project, spec)
     scope = f"for {project}" if project else "across all projects"
-    print(f"  Found {len(all_sessions)} sessions {scope}", file=sys.stderr)
+    print(f"  Found {len(all_sessions)} {spec.display_name} sessions {scope}", file=sys.stderr)
 
     # Phase 2-3: Load cached data + parse new sessions
     print("\n--- Phase 2-3: Load session-meta + facets ---", file=sys.stderr)
@@ -1802,18 +2360,18 @@ def cmd_report(args):
         sid = info["session_id"]
 
         # Try cached meta
-        cached_meta = load_cached_session_meta(sid)
+        cached_meta = load_cached_session_meta(sid, spec)
         if cached_meta:
             session_metas.append(cached_meta)
         else:
-            session = parse_jsonl(info["path"])
+            session = parse_agent_session(info["path"], spec)
             if session and not is_insights_session(session):
                 meta = extract_session_meta(session)
                 session_metas.append(meta)
                 parsed_sessions[sid] = session
 
         # Try cached facet
-        cached_facet = load_cached_facet(sid)
+        cached_facet = load_cached_facet(sid, spec)
         if cached_facet:
             facets[sid] = cached_facet
         elif len(need_facets) < MAX_NEW_FACETS:
@@ -1843,7 +2401,7 @@ def cmd_report(args):
             if sid in parsed_sessions:
                 session = parsed_sessions[sid]
             else:
-                session = parse_jsonl(info["path"])
+                session = parse_agent_session(info["path"], spec)
 
             if not session:
                 skipped_parse += 1
@@ -1857,12 +2415,12 @@ def cmd_report(args):
                 skipped_criteria += 1
                 continue
 
-            facet = generate_facet(session, dry_run=args.dry_run)
+            facet = generate_facet(session, spec, dry_run=args.dry_run)
             if facet:
                 facets[sid] = facet
                 if not args.dry_run:
-                    save_facet(facet)
-                    print(f"  wrote {OUT_FACETS_DIR / f'{sid}.json'}", file=sys.stderr)
+                    save_facet(facet, spec)
+                    print(f"  wrote {spec.out_facets_dir / f'{sid}.json'}", file=sys.stderr)
                 generated += 1
             else:
                 skipped_failed += 1
@@ -1880,6 +2438,8 @@ def cmd_report(args):
     print(f"\n--- Phase 5: Aggregate stats ---", file=sys.stderr)
     stats = aggregate_stats(filtered_metas, filtered_facets)
     stats["total_sessions_scanned"] = len(all_sessions)
+    stats["agent"] = spec.name
+    stats["agent_display"] = spec.display_name
     print(f"  {stats['total_sessions']} sessions, {stats['sessions_with_facets']} with facets", file=sys.stderr)
     print(f"  Date range: {stats['date_range']['start']} to {stats['date_range']['end']}", file=sys.stderr)
 
@@ -1887,47 +2447,134 @@ def cmd_report(args):
     print(f"\n--- Phase 6: Generate report (7 parallel LLM calls) ---", file=sys.stderr)
     print(f"  Model: {REPORT_MODEL}", file=sys.stderr)
     print(f"  Max tokens: 8192 per section", file=sys.stderr)
-    context = build_report_context(stats, filtered_facets)
+    context = build_report_context(stats, filtered_facets, spec)
     print(f"  Context length: {len(context)} chars", file=sys.stderr)
 
     sections = {}
-    for prompt_def in REPORT_PROMPTS:
+    for prompt_def in report_prompts(spec):
         name, result = generate_report_section(prompt_def, context, dry_run=args.dry_run)
         if result:
             sections[name] = result
 
     # at_a_glance runs after the 7 sections, using their results
     print(f"\n--- Phase 6b: Generate at_a_glance (uses results from Phase 6) ---", file=sys.stderr)
-    at_a_glance = generate_at_a_glance(context, sections, dry_run=args.dry_run)
+    at_a_glance = generate_at_a_glance(context, sections, spec, dry_run=args.dry_run)
     if at_a_glance:
         sections["at_a_glance"] = at_a_glance
 
     # Phase 7: Output
     elapsed = time.time() - total_start
     report = {
+        "agent": spec.name,
+        "agent_display": spec.display_name,
         "stats": stats,
         "sections": sections,
     }
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = OUTPUT_DIR / "report.json"
+    spec.output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = spec.output_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2))
     print(f"  wrote {report_path}", file=sys.stderr)
 
     # Phase 7b: Build HTML report
     print(f"\n--- Phase 7b: Build report.html ---", file=sys.stderr)
-    html = build_report_html(stats, sections)
-    html_path = OUTPUT_DIR / "report.html"
+    html = build_report_html(stats, sections, spec)
+    html_path = spec.output_dir / "report.html"
     html_path.write_text(html)
     print(f"  wrote {html_path} ({len(html):,} chars)", file=sys.stderr)
 
     print(f"\n--- Summary ---", file=sys.stderr)
     print(f"  Total elapsed: {elapsed:.1f}s", file=sys.stderr)
-    print(f"  Output dir:    {OUTPUT_DIR}/", file=sys.stderr)
+    print(f"  Output dir:    {spec.output_dir}/", file=sys.stderr)
     print(f"  Report JSON:   {report_path}", file=sys.stderr)
     print(f"  Report HTML:   file://{html_path}", file=sys.stderr)
-    facet_count = len(list(OUT_FACETS_DIR.glob("*.json"))) if OUT_FACETS_DIR.exists() else 0
-    print(f"  Facets:        {OUT_FACETS_DIR}/ ({facet_count} files)", file=sys.stderr)
+    facet_count = len(list(spec.out_facets_dir.glob("*.json"))) if spec.out_facets_dir.exists() else 0
+    print(f"  Facets:        {spec.out_facets_dir}/ ({facet_count} files)", file=sys.stderr)
+    return report
+
+
+def normalize_agents(agent_args: list[str] | None) -> list[str]:
+    agents = agent_args or ["claude"]
+    normalized = []
+    for agent in agents:
+        if agent not in AGENT_CHOICES:
+            raise ValueError(f"Unsupported agent: {agent}")
+        if agent not in normalized:
+            normalized.append(agent)
+    return normalized
+
+
+def run_agent_report_subprocesses(args, agents: list[str]) -> None:
+    print("=" * 60, file=sys.stderr)
+    print(f"INSIGHTS PIPELINE - {len(agents)} agents in parallel", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    env = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{package_root}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else package_root
+    )
+
+    processes = []
+    for agent in agents:
+        cmd = [sys.executable, "-m", "agent_insights.cli", "report", "--agent", agent]
+        if getattr(args, "dry_run", False):
+            cmd.append("--dry-run")
+        if getattr(args, "project", None):
+            cmd.extend(["--project", args.project])
+        if getattr(args, "skip_facets", False):
+            cmd.append("--skip-facets")
+        print(f"  starting {agent}: {' '.join(cmd)}", file=sys.stderr)
+        processes.append((
+            agent,
+            subprocess.Popen(
+                cmd,
+                cwd=Path.cwd(),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ),
+        ))
+
+    results = []
+    failed = False
+    for agent, process in processes:
+        stdout, stderr = process.communicate()
+        spec = get_agent_spec(agent, isolated_output=True)
+        if stderr:
+            print(f"\n--- {agent} stderr ---", file=sys.stderr)
+            print(stderr.rstrip(), file=sys.stderr)
+        if process.returncode != 0:
+            failed = True
+            if stdout:
+                print(f"\n--- {agent} stdout ---", file=sys.stderr)
+                print(stdout.rstrip()[-4000:], file=sys.stderr)
+        results.append({
+            "agent": agent,
+            "returncode": process.returncode,
+            "output_dir": str(spec.output_dir),
+            "report_json": str(spec.output_dir / "report.json"),
+            "report_html": str(spec.output_dir / "report.html"),
+        })
+
+    print(json.dumps({"agents": results}, indent=2))
+    if failed:
+        sys.exit(1)
+
+
+def cmd_report(args):
+    agents = normalize_agents(getattr(args, "agent", None))
+    explicit_agent = bool(getattr(args, "agent", None))
+    if len(agents) > 1:
+        run_agent_report_subprocesses(args, agents)
+        return
+
+    spec = get_agent_spec(agents[0], isolated_output=explicit_agent)
+    report = run_report_for_agent(args, spec)
     print(json.dumps(report, indent=2))
 
 
@@ -2059,7 +2706,7 @@ def cmd_corrections(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="agent-insights",
-        description="Generate Claude Code session insights reports",
+        description="Generate AI agent session insights reports",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2079,6 +2726,12 @@ def main():
 
     # report: full pipeline
     p_report = sub.add_parser("report", help="Run the full pipeline (facets + report)", parents=[parent])
+    p_report.add_argument(
+        "--agent",
+        action="append",
+        choices=AGENT_CHOICES,
+        help="Agent session logs to analyze. Repeat to analyze multiple agents in parallel. Default: claude",
+    )
     p_report.add_argument("--skip-facets", action="store_true", help="Skip facet generation, use only cached facets")
 
     # corrections: project-level correction extraction
