@@ -35,6 +35,15 @@ class CliOutputContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             return self.run_cli_in(Path(tmp), *args)
 
+    def test_version_flags_print_tool_version(self) -> None:
+        for arg in ("-v", "--version"):
+            with self.subTest(arg=arg):
+                result = self.run_cli(arg)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout, r"^agent-insights v\d+\.\d+\.\d+\n$")
+                self.assertEqual(result.stderr, "")
+
     def test_single_agent_report_keeps_json_on_stdout(self) -> None:
         result = self.run_cli("report", "--dry-run", "--skip-facets", "--agent", "claude")
 

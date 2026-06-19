@@ -50,7 +50,13 @@ python -m PyInstaller \
   packaging/pyinstaller/agent-insights.py
 
 dist_binary="dist/pyinstaller/${binary}"
-"${dist_binary}" --version
+version_output="$("${dist_binary}" --version)"
+expected_version="${binary} v${version}"
+if [ "${version_output}" != "${expected_version}" ]; then
+  echo "version mismatch: got '${version_output}', want '${expected_version}'" >&2
+  exit 1
+fi
+printf '%s\n' "${version_output}"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
