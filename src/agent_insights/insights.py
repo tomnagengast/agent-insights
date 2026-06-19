@@ -2504,6 +2504,12 @@ def normalize_agents(agent_args: list[str] | None) -> list[str]:
     return normalized
 
 
+def report_subprocess_command(agent: str) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "report", "--agent", agent]
+    return [sys.executable, "-m", "agent_insights.cli", "report", "--agent", agent]
+
+
 def run_agent_report_subprocesses(args, agents: list[str]) -> None:
     print("=" * 60, file=sys.stderr)
     print(f"INSIGHTS PIPELINE - {len(agents)} agents in parallel", file=sys.stderr)
@@ -2520,7 +2526,7 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
 
     processes = []
     for agent in agents:
-        cmd = [sys.executable, "-m", "agent_insights.cli", "report", "--agent", agent]
+        cmd = report_subprocess_command(agent)
         if getattr(args, "dry_run", False):
             cmd.append("--dry-run")
         if getattr(args, "project", None):
