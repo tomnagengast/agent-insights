@@ -2710,7 +2710,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--version", action="version", version="agent-insights 0.1.0")
+    parser.add_argument("-v", "--version", action="version", version="agent-insights 0.1.1")
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--dry-run", action="store_true", help="Show what would happen without making API calls")
     parent.add_argument("--project", help="Scope to a project path (e.g. /path/to/project)")

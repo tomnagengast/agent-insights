@@ -20,14 +20,14 @@ Run the standard checks:
 ```sh
 python -m compileall src
 python -m pip install -e '.[release]'
-scripts/build-release-archive.sh 0.1.0
+scripts/build-release-archive.sh 0.1.1
 ```
 
 Verify the generated executable:
 
 ```sh
 dist/pyinstaller/agent-insights --version
-tar -tzf dist/release/agent-insights_0.1.0_darwin_arm64.tar.gz
+tar -tzf dist/release/agent-insights_0.1.1_darwin_arm64.tar.gz
 ```
 
 ## Cut a release
@@ -35,8 +35,8 @@ tar -tzf dist/release/agent-insights_0.1.0_darwin_arm64.tar.gz
 Merge the release commit to `main`, then create and push the next semver tag:
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "v0.1.1"
+git push origin v0.1.1
 ```
 
 The `release` workflow only publishes from tag refs matching `v*.*.*`.
