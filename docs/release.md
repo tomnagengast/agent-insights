@@ -18,9 +18,10 @@ itself.
 Run the standard checks:
 
 ```sh
-python -m compileall src
-python -m pip install -e '.[release]'
-scripts/build-release-archive.sh 0.1.2
+uv run python -m compileall src
+uv run agent-insights report --dry-run --skip-facets
+uv run --extra release pyinstaller --version
+uv run --extra release scripts/build-release-archive.sh 0.1.2
 ```
 
 Verify the generated executable:
@@ -48,4 +49,5 @@ The workflow publishes a Homebrew cask. Install the latest release with:
 ```sh
 brew tap tomnagengast/tap
 brew install --cask tomnagengast/tap/agent-insights-cli
+agent-insights --version
 ```

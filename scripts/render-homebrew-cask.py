@@ -23,7 +23,7 @@ cask "agent-insights-cli" do
   end
 
   name "agent-insights-cli"
-  desc "CLI for generating Claude Code session insights reports."
+  desc "CLI for generating AI agent session insights reports."
   homepage "https://github.com/tomnagengast/agent-insights"
 
   livecheck do

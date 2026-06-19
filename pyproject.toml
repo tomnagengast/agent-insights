@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-insights"
 version = "0.1.2"
-description = "CLI for generating Claude Code session insights reports."
+description = "CLI for generating AI agent session insights reports."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
