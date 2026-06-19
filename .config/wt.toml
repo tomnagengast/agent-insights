@@ -1,0 +1,11 @@
+[pre-start]
+toolchain = "PATH=\"/opt/homebrew/bin:$PATH\"; command -v mise >/dev/null && mise trust && mise install || true"
+
+[[post-start]]
+copy = "wt step copy-ignored"
+
+[[post-start]]
+deps = "PATH=\"/opt/homebrew/bin:$PATH\"; mise install"
+
+[pre-merge]
+test = "PATH=\"/opt/homebrew/bin:$PATH\"; mise run test"

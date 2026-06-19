@@ -1,0 +1,58 @@
+[tools]
+python = "3.12"
+uv = "latest"
+gh = "latest"
+direnv = "latest"
+worktrunk = "latest"
+
+[env]
+UV_PYTHON = "3.12"
+
+[tasks.sync]
+description = "Install development and release dependencies"
+run = "uv sync --python 3.12 --extra release"
+
+[tasks.test]
+description = "Run the standard local verification"
+run = '''
+uv run --python 3.12 python -m compileall src
+uv run --python 3.12 agent-insights --help
+uv run --python 3.12 agent-insights --version
+uv run --python 3.12 agent-insights report --dry-run --skip-facets --agent claude --agent codex
+'''
+
+[tasks.release-check]
+description = "Build the local release archive used by the Homebrew cask"
+run = '''
+version="$(uv run --python 3.12 python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+uv run --python 3.12 --extra release pyinstaller --version
+uv run --python 3.12 --extra release scripts/build-release-archive.sh "${version}"
+'''
+
+[tasks.doctor]
+description = "Check repo toolchain and agent helper CLIs"
+run = '''
+missing=0
+for tool in mise direnv wt uv gh; do
+  if command -v "${tool}" >/dev/null 2>&1; then
+    printf "%-12s %s\n" "${tool}" "$(command -v "${tool}")"
+  else
+    printf "%-12s missing\n" "${tool}"
+    missing=1
+  fi
+done
+
+if command -v goreleaser >/dev/null 2>&1; then
+  printf "%-12s %s (not required by agent-insights)\n" "goreleaser" "$(command -v goreleaser)"
+else
+  printf "%-12s not required here; required by Go release repos\n" "goreleaser"
+fi
+
+if command -v memoryd >/dev/null 2>&1; then
+  printf "%-12s %s\n" "memoryd" "$(command -v memoryd)"
+else
+  printf "%-12s optional; unavailable for durable agent memory in this shell\n" "memoryd"
+fi
+
+exit "${missing}"
+'''
