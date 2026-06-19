@@ -12,7 +12,9 @@ license = { text = "MIT" }
 authors = [
   { name = "Thomas Nagengast" },
 ]
-dependencies = []
+dependencies = [
+  "rich>=14.0",
+]
 
 [project.optional-dependencies]
 release = [

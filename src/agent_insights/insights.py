@@ -44,6 +44,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .console import ConsoleRenderer
+from .console import format_elapsed
+from .console import stderr_console
 
 # ---------------------------------------------------------------------------
 # Constants (extracted from claude binary)
@@ -1052,8 +1055,9 @@ def call_api(
     Uses your authenticated Claude Code session (Max plan, API key, etc.)
     instead of requiring a separate ANTHROPIC_API_KEY.
     """
+    console = stderr_console()
     start = time.time()
-    print(f"  [{label}] Calling claude -p (model={model}, max_tokens={max_tokens})...", file=sys.stderr)
+    console.progress(label, console.join(["calling claude -p", f"model {model}", f"max tokens {max_tokens}"]))
 
     # Write prompt to a temp file to avoid shell escaping issues with large prompts
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -1088,11 +1092,21 @@ def call_api(
             stderr = result.stderr.strip()
             stdout = result.stdout.strip()
             detail = stderr or stdout  # claude -p sometimes writes errors to stdout
-            print(f"  [{label}] FAILED in {elapsed:.1f}s — exit {result.returncode}: {detail[:300]}", file=sys.stderr)
+            console.error(
+                console.join([
+                    f"{label or 'claude'} failed in {format_elapsed(elapsed)}",
+                    f"exit {result.returncode}: {detail[:300]}",
+                ])
+            )
             return None
 
         text = result.stdout.strip()
-        print(f"  [{label}] Done in {elapsed:.1f}s — {len(text)} chars response", file=sys.stderr)
+        console.success(
+            console.join([
+                f"{label or 'claude'} done in {format_elapsed(elapsed)}",
+                f"{len(text)} chars response",
+            ])
+        )
         return text
 
     finally:
@@ -1128,8 +1142,9 @@ def _discover_claude_sessions(project_path: str | None, spec: AgentSpec) -> list
             if d.is_dir() and (d.name == encoded or d.name.startswith(encoded + "-")):
                 project_dirs.append(d)
         if not project_dirs:
-            print(f"  Warning: no project dir found matching {project_path}", file=sys.stderr)
-            print(f"    Looking for: {encoded}*", file=sys.stderr)
+            console = stderr_console()
+            console.warning(f"no project dir found matching {project_path}")
+            console.detail(f"looking for {encoded}*")
 
     scan_dirs = project_dirs if project_dirs else [
         d for d in projects_dir.iterdir() if d.is_dir()
@@ -1261,7 +1276,12 @@ def prepare_transcript(session: ParsedSession, spec: AgentSpec | None = None) ->
     for i in range(0, len(transcript), TRANSCRIPT_CHUNK_SIZE):
         chunks.append(transcript[i : i + TRANSCRIPT_CHUNK_SIZE])
 
-    print(f"  Long session ({len(transcript)} chars) — summarizing {len(chunks)} chunks", file=sys.stderr)
+    console = stderr_console()
+    console.detail(console.join([
+        "long session",
+        f"{len(transcript)} chars",
+        f"summarizing {len(chunks)} chunks",
+    ]))
     summaries = [summarize_chunk(c, spec) for c in chunks]
 
     meta = extract_session_meta(session)
@@ -1289,9 +1309,10 @@ def generate_facet(session: ParsedSession, spec: AgentSpec | None = None, dry_ru
     user_prompt = facet_prompt_prefix(spec) + transcript + agent_schema_suffix(spec)
 
     if dry_run:
-        print(f"  [DRY RUN] Would generate facet for {session.session_id[:8]}", file=sys.stderr)
-        print(f"    Transcript length: {len(transcript)} chars", file=sys.stderr)
-        print(f"    Prompt length: {len(user_prompt)} chars", file=sys.stderr)
+        console = stderr_console()
+        console.skip(console.join(["dry run", f"would generate facet for {session.session_id[:8]}"]))
+        console.detail(f"transcript length {len(transcript)} chars")
+        console.detail(f"prompt length {len(user_prompt)} chars")
         return None
 
     text = call_api(
@@ -1306,7 +1327,7 @@ def generate_facet(session: ParsedSession, spec: AgentSpec | None = None, dry_ru
 
     facet = extract_json(text)
     if not facet or not validate_facet(facet):
-        print(f"  Warning: invalid facet for {session.session_id[:8]}", file=sys.stderr)
+        stderr_console().warning(f"invalid facet for {session.session_id[:8]}")
         return None
 
     facet["session_id"] = session.session_id
@@ -1371,7 +1392,8 @@ def extract_corrections(session: ParsedSession, dry_run: bool = False) -> dict |
     user_prompt = CORRECTION_PROMPT + transcript + CORRECTION_SCHEMA
 
     if dry_run:
-        print(f"  [DRY RUN] Would extract corrections for {session.session_id[:8]}", file=sys.stderr)
+        console = stderr_console()
+        console.skip(console.join(["dry run", f"would extract corrections for {session.session_id[:8]}"]))
         return None
 
     text = call_api(
@@ -1442,7 +1464,7 @@ def synthesize_rules(
             })
 
     if not all_corrections and not all_instructions:
-        print("  No corrections found across sessions", file=sys.stderr)
+        stderr_console().skip("no corrections found across sessions")
         return None
 
     corrections_text = json.dumps(all_corrections, indent=2)
@@ -1481,7 +1503,11 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
     )
 
     if dry_run:
-        print(f"  [DRY RUN] Would synthesize {len(all_corrections)} corrections + {len(all_instructions)} instructions", file=sys.stderr)
+        console = stderr_console()
+        console.skip(console.join([
+            "dry run",
+            f"would synthesize {len(all_corrections)} corrections + {len(all_instructions)} instructions",
+        ]))
         return None
 
     text = call_api(
@@ -1669,8 +1695,9 @@ def generate_report_section(
     user_prompt = prompt_def["prompt"] + "\nDATA:\n" + context
 
     if dry_run:
-        print(f"  [DRY RUN] Would generate report section '{name}'", file=sys.stderr)
-        print(f"    Context length: {len(context)} chars", file=sys.stderr)
+        console = stderr_console()
+        console.skip(console.join(["dry run", f"would generate report section {name}"]))
+        console.detail(f"context length {len(context)} chars")
         return name, None
 
     text = call_api(
@@ -1752,7 +1779,8 @@ SESSION DATA:
 {horizon}"""
 
     if dry_run:
-        print(f"  [DRY RUN] Would generate at_a_glance", file=sys.stderr)
+        console = stderr_console()
+        console.skip(console.join(["dry run", "would generate at_a_glance"]))
         return None
 
     text = call_api(
@@ -2242,48 +2270,59 @@ def build_report_html(stats: dict, sections: dict, spec: AgentSpec | None = None
 
 def cmd_facet(args):
     """Generate a facet for a single session JSONL file."""
+    console = stderr_console()
     spec = get_agent_spec("claude")
     path = Path(args.session_path)
+    console.title("Facet", subtitle=str(path))
     if not path.exists():
-        print(f"File not found: {path}", file=sys.stderr)
+        console.error(f"file not found: {path}")
         sys.exit(1)
 
-    print(f"Parsing {path}...", file=sys.stderr)
+    console.phase("Parse session")
     session = parse_agent_session(path, spec)
     if not session:
-        print("Failed to parse session", file=sys.stderr)
+        console.error("failed to parse session")
         sys.exit(1)
 
     meta = extract_session_meta(session)
-    print(f"Session {session.session_id[:8]}: {meta['user_message_count']} user msgs, {meta['duration_minutes']}min", file=sys.stderr)
+    console.detail(
+        console.join([
+            session.session_id[:8],
+            f"{meta['user_message_count']} user msgs",
+            f"{meta['duration_minutes']} min",
+        ])
+    )
 
     if is_insights_session(session):
-        print("Skipping: this is an /insights session", file=sys.stderr)
+        console.skip("skipping: this is an /insights session")
         sys.exit(0)
 
     if not meets_minimum_criteria(meta):
-        print(f"Skipping: doesn't meet minimum criteria (need >=2 user msgs, >=1 min)", file=sys.stderr)
+        console.skip(console.join(["skipping: below minimum criteria", "need >=2 user msgs and >=1 min"]))
         sys.exit(0)
 
+    console.phase("Generate facet")
     facet = generate_facet(session, spec, dry_run=args.dry_run)
     if facet:
         print(json.dumps(facet, indent=2))
         if args.save:
             save_facet(facet, spec)
             facet_path = spec.out_facets_dir / f"{facet['session_id']}.json"
-            print(f"Saved to {facet_path}", file=sys.stderr)
+            console.success(f"saved to {facet_path}")
     else:
-        print("No facet generated", file=sys.stderr)
+        console.skip("no facet generated")
 
 
 def cmd_facets(args):
     """Generate facets for all sessions missing them."""
+    console = stderr_console()
     spec = get_agent_spec("claude")
-    print("Phase 1: Discovering sessions...", file=sys.stderr)
+    console.title("Facets", subtitle=spec.display_name)
+    console.phase("Discover sessions")
     all_sessions = discover_sessions(getattr(args, "project", None), spec)
-    print(f"  Found {len(all_sessions)} session JSONL files", file=sys.stderr)
+    console.detail(f"{len(all_sessions)} session JSONL files found")
 
-    print("\nPhase 2-3: Loading cached session-meta and facets...", file=sys.stderr)
+    console.phase("Load cached facets")
     need_facets = []
 
     for info in all_sessions:
@@ -2298,9 +2337,9 @@ def cmd_facets(args):
             break
         need_facets.append(info)
 
-    print(f"  {len(need_facets)} sessions need facets (max {MAX_NEW_FACETS})", file=sys.stderr)
+    console.detail(console.join([f"{len(need_facets)} sessions need facets", f"max {MAX_NEW_FACETS}"]))
 
-    print(f"\nPhase 4: Generating facets...", file=sys.stderr)
+    console.phase("Generate facets")
     generated = 0
     skipped_parse = 0
     skipped_insights = 0
@@ -2326,34 +2365,45 @@ def cmd_facets(args):
             if not args.dry_run:
                 save_facet(facet, spec)
                 facet_path = spec.out_facets_dir / f"{facet['session_id']}.json"
-                print(f"  wrote {facet_path}", file=sys.stderr)
+                console.artifact("wrote", facet_path)
             generated += 1
-            print(f"  [{generated}/{len(need_facets)}] {session.session_id[:8]}: {facet.get('brief_summary', '')[:80]}", file=sys.stderr)
+            console.detail(
+                console.join([
+                    f"{generated}/{len(need_facets)}",
+                    session.session_id[:8],
+                    facet.get("brief_summary", "")[:80],
+                ])
+            )
         else:
             skipped_failed += 1
 
-    print(f"\nDone. Generated {generated} new facets.", file=sys.stderr)
+    console.success(f"generated {generated} new facets")
     if skipped_parse or skipped_insights or skipped_criteria or skipped_failed:
-        print(f"  Skipped: {skipped_parse} unparseable, {skipped_insights} insights-about-insights, "
-              f"{skipped_criteria} below minimum criteria, {skipped_failed} LLM call failed", file=sys.stderr)
+        console.skip(
+            console.join([
+                f"skipped {skipped_parse} unparseable",
+                f"{skipped_insights} insights-about-insights",
+                f"{skipped_criteria} below minimum criteria",
+                f"{skipped_failed} LLM call failed",
+            ])
+        )
 
 
 def run_report_for_agent(args, spec: AgentSpec) -> dict:
     """Full pipeline: discover → session-meta → facets → aggregate → report."""
-    print("=" * 60, file=sys.stderr)
-    print(f"INSIGHTS PIPELINE - {spec.display_name}", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
+    console = stderr_console()
     total_start = time.time()
 
     # Phase 1: Discover
     project = getattr(args, "project", None)
-    print("\n--- Phase 1: Discover session JSONL files ---", file=sys.stderr)
+    scope = f"project {project}" if project else "all projects"
+    console.title(spec.display_name, subtitle=console.join([f"scope {scope}", f"output {spec.output_dir}/"]))
+    console.phase("Discover sessions")
     all_sessions = discover_sessions(project, spec)
-    scope = f"for {project}" if project else "across all projects"
-    print(f"  Found {len(all_sessions)} {spec.display_name} sessions {scope}", file=sys.stderr)
+    console.detail(f"{len(all_sessions)} {spec.display_name} sessions found")
 
     # Phase 2-3: Load cached data + parse new sessions
-    print("\n--- Phase 2-3: Load session-meta + facets ---", file=sys.stderr)
+    console.phase("Load cache")
     session_metas: list[dict] = []
     facets: dict[str, dict] = {}
     need_facets: list[dict] = []
@@ -2380,18 +2430,18 @@ def run_report_for_agent(args, spec: AgentSpec) -> dict:
         elif len(need_facets) < MAX_NEW_FACETS:
             need_facets.append(info)
 
-    print(f"  {len(session_metas)} session-metas loaded", file=sys.stderr)
-    print(f"  {len(facets)} cached facets", file=sys.stderr)
-    print(f"  {len(need_facets)} sessions need new facets", file=sys.stderr)
+    console.detail(f"{len(session_metas)} session-meta records loaded")
+    console.detail(f"{len(facets)} cached facets")
+    console.detail(f"{len(need_facets)} sessions need new facets")
 
     # Phase 4: Generate new facets
     generated = 0
     if getattr(args, "skip_facets", False):
-        print(f"\n--- Phase 4: SKIPPED (--skip-facets) ---", file=sys.stderr)
+        console.phase("Generate facets", detail="skipped by --skip-facets", skipped=True)
     else:
-        print(f"\n--- Phase 4: Generate new facets ({len(need_facets)} sessions) ---", file=sys.stderr)
-        print(f"  Model: {FACET_MODEL}", file=sys.stderr)
-        print(f"  Max tokens: 4096 per facet", file=sys.stderr)
+        console.phase("Generate facets", detail=f"{len(need_facets)} sessions")
+        console.detail(f"model {FACET_MODEL}")
+        console.detail("max tokens 4096 per facet")
 
         skipped_parse = 0
         skipped_insights = 0
@@ -2423,35 +2473,44 @@ def run_report_for_agent(args, spec: AgentSpec) -> dict:
                 facets[sid] = facet
                 if not args.dry_run:
                     save_facet(facet, spec)
-                    print(f"  wrote {spec.out_facets_dir / f'{sid}.json'}", file=sys.stderr)
+                    console.artifact("wrote", spec.out_facets_dir / f"{sid}.json")
                 generated += 1
             else:
                 skipped_failed += 1
 
-        print(f"  Generated {generated} new facets", file=sys.stderr)
+        console.success(f"generated {generated} new facets")
         if skipped_parse or skipped_insights or skipped_criteria or skipped_failed:
-            print(f"  Skipped: {skipped_parse} unparseable, {skipped_insights} insights-about-insights, "
-                  f"{skipped_criteria} below minimum criteria, {skipped_failed} LLM call failed", file=sys.stderr)
+            console.skip(
+                console.join([
+                    f"skipped {skipped_parse} unparseable",
+                    f"{skipped_insights} insights-about-insights",
+                    f"{skipped_criteria} below minimum criteria",
+                    f"{skipped_failed} LLM call failed",
+                ])
+            )
 
     # Filter warmup sessions
     filtered_metas = [m for m in session_metas if meets_minimum_criteria(m) and not is_warmup_only(facets.get(m["session_id"], {}))]
     filtered_facets = {k: v for k, v in facets.items() if not is_warmup_only(v)}
 
     # Phase 5: Aggregate stats
-    print(f"\n--- Phase 5: Aggregate stats ---", file=sys.stderr)
+    console.phase("Aggregate stats")
     stats = aggregate_stats(filtered_metas, filtered_facets)
     stats["total_sessions_scanned"] = len(all_sessions)
     stats["agent"] = spec.name
     stats["agent_display"] = spec.display_name
-    print(f"  {stats['total_sessions']} sessions, {stats['sessions_with_facets']} with facets", file=sys.stderr)
-    print(f"  Date range: {stats['date_range']['start']} to {stats['date_range']['end']}", file=sys.stderr)
+    console.detail(console.join([
+        f"{stats['total_sessions']} sessions",
+        f"{stats['sessions_with_facets']} with facets",
+    ]))
+    console.detail(f"date range {stats['date_range']['start']} to {stats['date_range']['end']}")
 
     # Phase 6: Generate report sections (7 parallel + 1 sequential)
-    print(f"\n--- Phase 6: Generate report (7 parallel LLM calls) ---", file=sys.stderr)
-    print(f"  Model: {REPORT_MODEL}", file=sys.stderr)
-    print(f"  Max tokens: 8192 per section", file=sys.stderr)
+    console.phase("Generate report sections", detail="7 LLM calls")
+    console.detail(f"model {REPORT_MODEL}")
+    console.detail("max tokens 8192 per section")
     context = build_report_context(stats, filtered_facets, spec)
-    print(f"  Context length: {len(context)} chars", file=sys.stderr)
+    console.detail(f"context length {len(context)} chars")
 
     sections = {}
     for prompt_def in report_prompts(spec):
@@ -2460,7 +2519,7 @@ def run_report_for_agent(args, spec: AgentSpec) -> dict:
             sections[name] = result
 
     # at_a_glance runs after the 7 sections, using their results
-    print(f"\n--- Phase 6b: Generate at_a_glance (uses results from Phase 6) ---", file=sys.stderr)
+    console.phase("Generate at a glance", detail="uses report section results")
     at_a_glance = generate_at_a_glance(context, sections, spec, dry_run=args.dry_run)
     if at_a_glance:
         sections["at_a_glance"] = at_a_glance
@@ -2477,22 +2536,23 @@ def run_report_for_agent(args, spec: AgentSpec) -> dict:
     spec.output_dir.mkdir(parents=True, exist_ok=True)
     report_path = spec.output_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2))
-    print(f"  wrote {report_path}", file=sys.stderr)
+    console.phase("Write report")
+    console.artifact("report json", report_path)
 
     # Phase 7b: Build HTML report
-    print(f"\n--- Phase 7b: Build report.html ---", file=sys.stderr)
     html = build_report_html(stats, sections, spec)
     html_path = spec.output_dir / "report.html"
     html_path.write_text(html)
-    print(f"  wrote {html_path} ({len(html):,} chars)", file=sys.stderr)
+    console.artifact("report html", html_path, extra=f"{len(html):,} chars")
 
-    print(f"\n--- Summary ---", file=sys.stderr)
-    print(f"  Total elapsed: {elapsed:.1f}s", file=sys.stderr)
-    print(f"  Output dir:    {spec.output_dir}/", file=sys.stderr)
-    print(f"  Report JSON:   {report_path}", file=sys.stderr)
-    print(f"  Report HTML:   file://{html_path}", file=sys.stderr)
     facet_count = len(list(spec.out_facets_dir.glob("*.json"))) if spec.out_facets_dir.exists() else 0
-    print(f"  Facets:        {spec.out_facets_dir}/ ({facet_count} files)", file=sys.stderr)
+    console.summary([
+        ("elapsed", format_elapsed(elapsed)),
+        ("output dir", f"{spec.output_dir}/"),
+        ("report json", report_path),
+        ("report html", f"file://{html_path}"),
+        ("facets", f"{spec.out_facets_dir}/ ({facet_count} files)"),
+    ])
     return report
 
 
@@ -2528,16 +2588,16 @@ def drain_agent_report_stdout(stream, buffer: list[str]) -> None:
     stream.close()
 
 
-def stream_agent_report_stderr(agent: str, stream) -> None:
+def stream_agent_report_stderr(agent: str, stream, console: ConsoleRenderer, label_width: int) -> None:
     for line in iter(stream.readline, ""):
-        print(f"  [{agent}] {line.rstrip()}", file=sys.stderr, flush=True)
+        console.agent_line(agent, line.rstrip(), label_width=label_width)
     stream.close()
 
 
 def run_agent_report_subprocesses(args, agents: list[str]) -> None:
-    print("=" * 60, file=sys.stderr, flush=True)
-    print(f"INSIGHTS PIPELINE - {len(agents)} agents in parallel", file=sys.stderr, flush=True)
-    print("=" * 60, file=sys.stderr, flush=True)
+    console = stderr_console()
+    console.title(f"{len(agents)} agents in parallel")
+    label_width = max(len(agent) for agent in agents)
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -2558,7 +2618,7 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
             cmd.extend(["--project", args.project])
         if getattr(args, "skip_facets", False):
             cmd.append("--skip-facets")
-        print(f"  starting {agent}: {' '.join(cmd)}", file=sys.stderr, flush=True)
+        console.agent_line(agent, f"{console.glyphs.phase} starting {' '.join(cmd)}", label_width=label_width)
         process = subprocess.Popen(
             cmd,
             cwd=Path.cwd(),
@@ -2576,7 +2636,7 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
         )
         stderr_thread = threading.Thread(
             target=stream_agent_report_stderr,
-            args=(agent, process.stderr),
+            args=(agent, process.stderr, console, label_width),
         )
         stdout_thread.start()
         stderr_thread.start()
@@ -2596,16 +2656,25 @@ def run_agent_report_subprocesses(args, agents: list[str]) -> None:
             thread.join()
         stdout = "".join(running.stdout)
         spec = get_agent_spec(running.agent, isolated_output=True)
-        print(
-            f"  finished {running.agent}: exit {returncode} in {time.time() - running.started_at:.1f}s",
-            file=sys.stderr,
-            flush=True,
-        )
+        elapsed = time.time() - running.started_at
+        if returncode == 0:
+            console.agent_line(
+                running.agent,
+                f"{console.glyphs.success} {console.join(['finished', f'exit {returncode}', format_elapsed(elapsed)])}",
+                label_width=label_width,
+            )
+        else:
+            console.agent_line(
+                running.agent,
+                f"{console.glyphs.error} {console.join(['finished', f'exit {returncode}', format_elapsed(elapsed)])}",
+                label_width=label_width,
+            )
         if returncode != 0:
             failed = True
             if stdout:
-                print(f"\n--- {running.agent} stdout ---", file=sys.stderr)
-                print(stdout.rstrip()[-4000:], file=sys.stderr)
+                console.phase(f"{running.agent} stdout excerpt")
+                for line in stdout.rstrip()[-4000:].splitlines():
+                    console.detail(line)
         results.append({
             "agent": running.agent,
             "returncode": returncode,
@@ -2633,11 +2702,13 @@ def cmd_report(args):
 
 def cmd_corrections(args):
     """Extract corrections from project sessions and synthesize CLAUDE.md rules."""
+    console = stderr_console()
+    console.title("Corrections")
     project = getattr(args, "project", None)
     if not project:
         # Auto-detect from CWD
         project = str(Path.cwd())
-        print(f"No --project specified, using CWD: {project}", file=sys.stderr)
+        console.detail(console.join(["no --project specified", f"using CWD {project}"]))
 
     max_sessions = args.max_sessions
 
@@ -2650,17 +2721,17 @@ def cmd_corrections(args):
     claude_md_content = ""
     if claude_md_path and Path(claude_md_path).exists():
         claude_md_content = Path(claude_md_path).read_text()
-        print(f"CLAUDE.md: {claude_md_path} ({len(claude_md_content)} chars)", file=sys.stderr)
+        console.detail(console.join([f"CLAUDE.md {claude_md_path}", f"{len(claude_md_content)} chars"]))
     else:
-        print(f"No CLAUDE.md found (will still extract corrections)", file=sys.stderr)
+        console.warning(console.join(["no CLAUDE.md found", "will still extract corrections"]))
 
     # Phase 1: Discover project sessions
-    print(f"\n--- Phase 1: Discover sessions for {project} ---", file=sys.stderr)
+    console.phase("Discover sessions", detail=f"project {project}")
     all_sessions = discover_sessions(project)
-    print(f"  Found {len(all_sessions)} sessions", file=sys.stderr)
+    console.detail(f"{len(all_sessions)} sessions found")
 
     # Phase 2: Parse and filter
-    print(f"\n--- Phase 2: Parse sessions (max {max_sessions}) ---", file=sys.stderr)
+    console.phase("Parse sessions", detail=f"max {max_sessions}")
     sessions = []
     for info in all_sessions:
         if len(sessions) >= max_sessions:
@@ -2675,10 +2746,10 @@ def cmd_corrections(args):
             continue
         sessions.append(session)
 
-    print(f"  {len(sessions)} sessions to analyze", file=sys.stderr)
+    console.detail(f"{len(sessions)} sessions to analyze")
 
     # Phase 3: Extract corrections from each session
-    print(f"\n--- Phase 3: Extract corrections ---", file=sys.stderr)
+    console.phase("Extract corrections")
     all_corrections = []
     for i, session in enumerate(sessions):
         result = extract_corrections(session, dry_run=args.dry_run)
@@ -2687,60 +2758,73 @@ def cmd_corrections(args):
             n_inst = len(result.get("repeated_instructions", []))
             if n_corr > 0 or n_inst > 0:
                 all_corrections.append(result)
-                print(f"  [{i+1}/{len(sessions)}] {session.session_id[:8]}: {n_corr} corrections, {n_inst} instructions", file=sys.stderr)
+                console.detail(
+                    console.join([
+                        f"{i+1}/{len(sessions)}",
+                        session.session_id[:8],
+                        f"{n_corr} corrections",
+                        f"{n_inst} instructions",
+                    ])
+                )
             else:
-                print(f"  [{i+1}/{len(sessions)}] {session.session_id[:8]}: clean session", file=sys.stderr)
+                console.detail(console.join([
+                    f"{i+1}/{len(sessions)}",
+                    session.session_id[:8],
+                    "clean session",
+                ]))
 
     if args.dry_run:
-        print(f"\n[DRY RUN] Would analyze {len(sessions)} sessions", file=sys.stderr)
+        console.skip(console.join(["dry run", f"would analyze {len(sessions)} sessions"]))
         return
 
     # Save raw corrections
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     corrections_path = OUTPUT_DIR / "corrections.json"
     corrections_path.write_text(json.dumps(all_corrections, indent=2))
-    print(f"  wrote {corrections_path}", file=sys.stderr)
+    console.artifact("corrections", corrections_path)
 
     total_corr = sum(len(c.get("corrections", [])) for c in all_corrections)
     total_inst = sum(len(c.get("repeated_instructions", [])) for c in all_corrections)
-    print(f"  Total: {total_corr} corrections, {total_inst} repeated instructions across {len(all_corrections)} sessions", file=sys.stderr)
+    console.detail(
+        console.join([
+            f"total {total_corr} corrections",
+            f"{total_inst} repeated instructions",
+            f"{len(all_corrections)} sessions",
+        ])
+    )
 
     if not all_corrections:
-        print("\nNo corrections found — nothing to synthesize.", file=sys.stderr)
+        console.skip(console.join(["no corrections found", "nothing to synthesize"]))
         return
 
     # Phase 4: Synthesize into CLAUDE.md rules
-    print(f"\n--- Phase 4: Synthesize CLAUDE.md rules ---", file=sys.stderr)
+    console.phase("Synthesize CLAUDE.md rules")
     rules = synthesize_rules(all_corrections, claude_md_content, dry_run=args.dry_run)
 
     if rules:
         rules_path = OUTPUT_DIR / "rules.json"
         rules_path.write_text(json.dumps(rules, indent=2))
-        print(f"  wrote {rules_path}", file=sys.stderr)
+        console.artifact("rules", rules_path)
 
         # Print human-readable summary
-        print(f"\n{'='*60}", file=sys.stderr)
-        print("SUGGESTED CLAUDE.MD RULES", file=sys.stderr)
-        print(f"{'='*60}", file=sys.stderr)
+        console.phase("Suggested CLAUDE.md rules")
         for r in rules.get("rules", []):
             freq = r.get("frequency", 1)
             sev = r.get("severity", "?")
             section = r.get("section", "?")
-            print(f"\n  [{sev}, {freq}x] → {section}", file=sys.stderr)
-            print(f"    {r['rule']}", file=sys.stderr)
+            console.detail(console.join([sev, f"{freq}x", section]))
+            console.detail(r["rule"])
             if r.get("evidence"):
-                print(f"    Evidence: {r['evidence']}", file=sys.stderr)
+                console.detail(f"evidence: {r['evidence']}")
 
         violated = rules.get("already_covered", [])
         if violated:
-            print(f"\n{'='*60}", file=sys.stderr)
-            print("EXISTING RULES BEING VIOLATED", file=sys.stderr)
-            print(f"{'='*60}", file=sys.stderr)
+            console.phase("Existing rules being violated")
             for v in violated:
-                print(f"\n  Rule: {v['rule']}", file=sys.stderr)
-                print(f"  Violated in: {v.get('but_violated_in', [])}", file=sys.stderr)
+                console.detail(f"rule: {v['rule']}")
+                console.detail(f"violated in: {v.get('but_violated_in', [])}")
                 if v.get("suggestion"):
-                    print(f"  Suggestion: {v['suggestion']}", file=sys.stderr)
+                    console.detail(f"suggestion: {v['suggestion']}")
 
     # Also dump full output to stdout as JSON
     output = {
